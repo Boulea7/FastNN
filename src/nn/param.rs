@@ -14,6 +14,7 @@
 //! [`Buffer`] is the same sharing without a gradient: state that persists and is
 //! checkpointed but is not learned, such as batch-norm running statistics.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 
 use crate::autograd::GradSlot;
@@ -24,6 +25,8 @@ use crate::tensor::{Device, Tensor};
 pub struct Param {
     value: Arc<RwLock<Tensor>>,
     grad: GradSlot,
+    /// Shared with every clone, so freezing through one handle freezes them all.
+    trainable: Arc<AtomicBool>,
 }
 
 impl Param {
@@ -32,20 +35,47 @@ impl Param {
         Param {
             value: Arc::new(RwLock::new(value.detach())),
             grad: GradSlot::new(),
+            trainable: Arc::new(AtomicBool::new(true)),
         }
     }
 
-    /// This parameter as a graph leaf, for use in a forward pass.
+    /// This parameter as a tensor, for use in a forward pass.
     ///
-    /// Gradients that reach the returned tensor land in this parameter's slot.
+    /// Normally a graph leaf, so gradients reaching it land in this parameter's
+    /// slot. While frozen it comes back detached instead — the backward pass then
+    /// stops at this point on its own, costing nothing to compute a gradient that
+    /// would only be discarded.
     pub fn tensor(&self) -> Tensor {
         let value = self.value.read().unwrap();
+        if !self.is_trainable() {
+            return value.detach();
+        }
         Tensor::leaf(
             value.storage_arc(),
             value.shape().to_vec(),
             value.device(),
             self.grad.clone(),
         )
+    }
+
+    /// Stop training this parameter. Optimizers skip it and no gradient is
+    /// computed for it at all.
+    ///
+    /// The usual reason is transfer learning: freeze a pretrained backbone and
+    /// train only the new head on top.
+    pub fn freeze(&self) {
+        self.trainable.store(false, Ordering::Relaxed);
+        self.grad.clear();
+    }
+
+    /// Resume training this parameter.
+    pub fn unfreeze(&self) {
+        self.trainable.store(true, Ordering::Relaxed);
+    }
+
+    /// Whether optimizers should update this parameter.
+    pub fn is_trainable(&self) -> bool {
+        self.trainable.load(Ordering::Relaxed)
     }
 
     /// The current value, detached from the graph.

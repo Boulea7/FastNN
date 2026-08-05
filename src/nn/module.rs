@@ -72,6 +72,28 @@ pub trait Module: Send + Sync {
         }
     }
 
+    /// Stop training every parameter in this module.
+    ///
+    /// Freeze a pretrained backbone, leave the head trainable, and the optimizer
+    /// updates only the head — the backward pass does not even compute the rest.
+    fn freeze(&self) {
+        for (_, p) in self.named_parameters() {
+            p.freeze();
+        }
+    }
+
+    /// Resume training every parameter in this module.
+    fn unfreeze(&self) {
+        for (_, p) in self.named_parameters() {
+            p.unfreeze();
+        }
+    }
+
+    /// The parameters an optimizer will actually update.
+    fn trainable_parameters(&self) -> Vec<Param> {
+        self.parameters().into_iter().filter(Param::is_trainable).collect()
+    }
+
     /// Discard all accumulated gradients.
     fn zero_grad(&self) {
         for (_, p) in self.named_parameters() {
