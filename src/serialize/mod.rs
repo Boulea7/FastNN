@@ -1,3 +1,5 @@
+//! Checkpointing models to disk.
+
 pub mod checkpoint;
 
-pub use checkpoint::{save_model, load_model, save_tensors, load_tensors};
+pub use checkpoint::{load, load_tensors, save, save_tensors, Checkpoint};

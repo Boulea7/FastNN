@@ -1,83 +1,137 @@
-use std::collections::HashMap;
+//! Saving and loading model weights.
+//!
+//! ## File format (`.fdl`)
+//!
+//! ```text
+//! magic "FDL\0"  u32
+//! version        u32
+//! count          u32
+//! repeated count times:
+//!     name_len   u32
+//!     name       name_len bytes, UTF-8
+//!     rank       u32
+//!     shape      rank × u32
+//!     data       numel × f32, little-endian
+//! ```
+//!
+//! Plain and self-describing: a checkpoint carries names and shapes, so loading
+//! into a changed model reports which tensor disagrees instead of silently
+//! filling weights with the wrong numbers.
+
+use std::collections::BTreeMap;
 use std::fs::File;
-use std::io::{Read, Write, BufWriter, BufReader};
+use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::Path;
 
-use crate::tensor::Tensor;
+use crate::error::{Error, Result};
 use crate::nn::Module;
+use crate::tensor::Tensor;
 
-/// Serialized tensor format: name_len(u32) + name(bytes) + ndim(u32) + shape(u32*ndim) + data(f32*numel)
-/// File format: magic(u32) + version(u32) + num_tensors(u32) + tensors...
-
-const MAGIC: u32 = 0x46444C00; // "FDL\0"
+const MAGIC: u32 = 0x4644_4C00;
 const VERSION: u32 = 1;
 
-/// Save named tensors to a binary file.
-pub fn save_tensors(tensors: &HashMap<String, Tensor>, path: impl AsRef<Path>) -> Result<(), String> {
-    let file = File::create(path).map_err(|e| format!("Failed to create file: {}", e))?;
-    let mut writer = BufWriter::new(file);
+/// A named collection of tensors — what a saved model is.
+///
+/// `BTreeMap` so the on-disk order is stable and two checkpoints of the same
+/// model compare byte for byte.
+pub type Checkpoint = BTreeMap<String, Tensor>;
 
-    write_u32(&mut writer, MAGIC)?;
-    write_u32(&mut writer, VERSION)?;
-    write_u32(&mut writer, tensors.len() as u32)?;
-
-    for (name, tensor) in tensors {
-        let name_bytes = name.as_bytes();
-        write_u32(&mut writer, name_bytes.len() as u32)?;
-        writer.write_all(name_bytes).map_err(|e| e.to_string())?;
-
-        let shape = tensor.shape();
-        write_u32(&mut writer, shape.len() as u32)?;
-        for &dim in shape {
-            write_u32(&mut writer, dim as u32)?;
-        }
-
-        let data = tensor.to_vec();
-        for &val in &data {
-            writer.write_all(&val.to_le_bytes()).map_err(|e| e.to_string())?;
-        }
+/// Write a module's parameters and buffers to `path`.
+///
+/// ```no_run
+/// # use fastnn::prelude::*;
+/// # let model = Sequential::new().add(Linear::new(4, 2));
+/// save(&model, "model.fdl")?;
+/// # Ok::<(), fastnn::Error>(())
+/// ```
+pub fn save(module: &dyn Module, path: impl AsRef<Path>) -> Result<()> {
+    let mut tensors = Checkpoint::new();
+    for (name, param) in module.named_parameters() {
+        tensors.insert(name, param.value().cpu());
     }
+    for (name, buffer) in module.named_buffers() {
+        tensors.insert(name, buffer.value().cpu());
+    }
+    save_tensors(&tensors, path)
+}
 
-    writer.flush().map_err(|e| e.to_string())?;
+/// Read `path` into a module's parameters and buffers.
+///
+/// Every parameter the module declares must be present with a matching shape;
+/// extra tensors in the file are ignored.
+pub fn load(module: &dyn Module, path: impl AsRef<Path>) -> Result<()> {
+    let saved = load_tensors(path)?;
+
+    for (name, param) in module.named_parameters() {
+        let value = take(&saved, &name, &param.shape())?;
+        param.set_value(value.to(param.device()));
+    }
+    for (name, buffer) in module.named_buffers() {
+        let device = buffer.value().device();
+        let value = take(&saved, &name, buffer.value().shape())?;
+        buffer.set_value(value.to(device));
+    }
     Ok(())
 }
 
-/// Load named tensors from a binary file.
-pub fn load_tensors(path: impl AsRef<Path>) -> Result<HashMap<String, Tensor>, String> {
-    let file = File::open(path).map_err(|e| format!("Failed to open file: {}", e))?;
-    let mut reader = BufReader::new(file);
+/// Write named tensors to `path`.
+pub fn save_tensors(tensors: &Checkpoint, path: impl AsRef<Path>) -> Result<()> {
+    let mut out = BufWriter::new(File::create(path)?);
 
-    let magic = read_u32(&mut reader)?;
-    if magic != MAGIC {
-        return Err("Invalid file format (bad magic number)".to_string());
-    }
+    write_u32(&mut out, MAGIC)?;
+    write_u32(&mut out, VERSION)?;
+    write_u32(&mut out, tensors.len() as u32)?;
 
-    let version = read_u32(&mut reader)?;
-    if version != VERSION {
-        return Err(format!("Unsupported version: {}", version));
-    }
+    for (name, tensor) in tensors {
+        write_u32(&mut out, name.len() as u32)?;
+        out.write_all(name.as_bytes())?;
 
-    let num_tensors = read_u32(&mut reader)? as usize;
-    let mut tensors = HashMap::new();
-
-    for _ in 0..num_tensors {
-        let name_len = read_u32(&mut reader)? as usize;
-        let mut name_bytes = vec![0u8; name_len];
-        reader.read_exact(&mut name_bytes).map_err(|e| e.to_string())?;
-        let name = String::from_utf8(name_bytes).map_err(|e| e.to_string())?;
-
-        let ndim = read_u32(&mut reader)? as usize;
-        let mut shape = Vec::with_capacity(ndim);
-        for _ in 0..ndim {
-            shape.push(read_u32(&mut reader)? as usize);
+        write_u32(&mut out, tensor.ndim() as u32)?;
+        for &dim in tensor.shape() {
+            write_u32(&mut out, dim as u32)?;
         }
+        for value in tensor.to_vec() {
+            out.write_all(&value.to_le_bytes())?;
+        }
+    }
 
-        let numel: usize = shape.iter().product();
-        let mut data = vec![0.0f32; numel];
-        for val in &mut data {
-            let mut buf = [0u8; 4];
-            reader.read_exact(&mut buf).map_err(|e| e.to_string())?;
-            *val = f32::from_le_bytes(buf);
+    out.flush()?;
+    Ok(())
+}
+
+/// Read named tensors from `path`.
+pub fn load_tensors(path: impl AsRef<Path>) -> Result<Checkpoint> {
+    let mut input = BufReader::new(File::open(path)?);
+
+    if read_u32(&mut input)? != MAGIC {
+        return Err(Error::Checkpoint("not a fastnn checkpoint".into()));
+    }
+    let version = read_u32(&mut input)?;
+    if version != VERSION {
+        return Err(Error::Checkpoint(format!(
+            "file is version {version}, this build reads version {VERSION}"
+        )));
+    }
+
+    let count = read_u32(&mut input)?;
+    let mut tensors = Checkpoint::new();
+    for _ in 0..count {
+        let name_len = read_u32(&mut input)? as usize;
+        let mut name = vec![0u8; name_len];
+        input.read_exact(&mut name)?;
+        let name = String::from_utf8(name)
+            .map_err(|_| Error::Checkpoint("tensor name is not valid UTF-8".into()))?;
+
+        let rank = read_u32(&mut input)? as usize;
+        let shape: Vec<usize> = (0..rank)
+            .map(|_| read_u32(&mut input).map(|d| d as usize))
+            .collect::<Result<_>>()?;
+
+        let mut data = vec![0.0f32; shape.iter().product()];
+        for value in &mut data {
+            let mut bytes = [0u8; 4];
+            input.read_exact(&mut bytes)?;
+            *value = f32::from_le_bytes(bytes);
         }
 
         tensors.insert(name, Tensor::from_vec(data, &shape));
@@ -86,37 +140,27 @@ pub fn load_tensors(path: impl AsRef<Path>) -> Result<HashMap<String, Tensor>, S
     Ok(tensors)
 }
 
-/// Save a module's parameters to a file.
-pub fn save_model(module: &dyn Module, path: impl AsRef<Path>) -> Result<(), String> {
-    let params = module.named_parameters();
-    save_tensors(&params, path)
-}
-
-/// Load parameters from a file into a module's named parameters.
-pub fn load_model(params: &HashMap<String, Tensor>, path: impl AsRef<Path>) -> Result<HashMap<String, Tensor>, String> {
-    let loaded = load_tensors(path)?;
-
-    // Verify shapes match
-    for (name, tensor) in params {
-        if let Some(loaded_tensor) = loaded.get(name) {
-            if tensor.shape() != loaded_tensor.shape() {
-                return Err(format!(
-                    "Shape mismatch for '{}': expected {:?}, got {:?}",
-                    name, tensor.shape(), loaded_tensor.shape()
-                ));
-            }
-        }
+/// Look up `name` and check it is the shape the model expects.
+fn take(saved: &Checkpoint, name: &str, expected: &[usize]) -> Result<Tensor> {
+    let tensor = saved
+        .get(name)
+        .ok_or_else(|| Error::Checkpoint(format!("checkpoint has no tensor named '{name}'")))?;
+    if tensor.shape() != expected {
+        return Err(Error::Checkpoint(format!(
+            "'{name}' is {:?} in the file but {expected:?} in the model",
+            tensor.shape()
+        )));
     }
-
-    Ok(loaded)
+    Ok(tensor.clone())
 }
 
-fn write_u32(writer: &mut impl Write, val: u32) -> Result<(), String> {
-    writer.write_all(&val.to_le_bytes()).map_err(|e| e.to_string())
+fn write_u32(out: &mut impl Write, value: u32) -> Result<()> {
+    out.write_all(&value.to_le_bytes())?;
+    Ok(())
 }
 
-fn read_u32(reader: &mut impl Read) -> Result<u32, String> {
-    let mut buf = [0u8; 4];
-    reader.read_exact(&mut buf).map_err(|e| e.to_string())?;
-    Ok(u32::from_le_bytes(buf))
+fn read_u32(input: &mut impl Read) -> Result<u32> {
+    let mut bytes = [0u8; 4];
+    input.read_exact(&mut bytes)?;
+    Ok(u32::from_le_bytes(bytes))
 }
