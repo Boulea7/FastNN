@@ -1,165 +1,75 @@
-use std::sync::Arc;
+//! Loss functions.
+//!
+//! Free functions, not layers — a loss has no parameters and no state, so
+//! `cross_entropy(&logits, &targets)` says everything a struct would.
 
+use crate::autograd::ops::loss::CrossEntropyBackward;
 use crate::tensor::Tensor;
-use crate::autograd::graph;
-use crate::autograd::backward_ops::CrossEntropyBackward;
 
-/// Cross-entropy loss for classification.
-/// Expects logits [batch, num_classes] and targets [batch] (class indices).
+/// Mean cross-entropy between `logits` `[batch, classes]` and integer class targets.
 ///
-/// Implemented as a fused autograd op: the forward computes softmax + log_softmax
-/// + NLL together (numerically stable), and records a backward node that produces
-/// `(softmax - one_hot) / batch_size` directly — avoiding the need for indexing
-/// ops in the autograd graph.
-pub struct CrossEntropyLoss;
+/// Takes raw logits, not probabilities: softmax and the log are fused here, so
+/// the numerically dangerous `log(exp(...))` never appears and a confidently
+/// wrong prediction yields a large finite loss instead of infinity.
+pub fn cross_entropy(logits: &Tensor, targets: &[usize]) -> Tensor {
+    assert_eq!(logits.ndim(), 2, "cross_entropy expects [batch, classes], got {:?}", logits.shape());
+    let (batch, classes) = (logits.dim(0), logits.dim(1));
+    assert_eq!(targets.len(), batch, "cross_entropy: {} targets for {batch} rows", targets.len());
 
-impl CrossEntropyLoss {
-    pub fn new() -> Self { CrossEntropyLoss }
+    let data = logits.to_vec();
+    let mut softmax = vec![0.0f32; batch * classes];
+    let mut total = 0.0f32;
 
-    pub fn forward(&self, logits: &Tensor, targets: &[usize]) -> Tensor {
-        let shape = logits.shape();
-        assert_eq!(shape.len(), 2, "Expected [batch, num_classes]");
-        let (batch_size, num_classes) = (shape[0], shape[1]);
-        assert_eq!(targets.len(), batch_size);
+    for (row, &target) in targets.iter().enumerate() {
+        assert!(target < classes, "cross_entropy: target {target} outside 0..{classes}");
+        let base = row * classes;
+        let values = &data[base..base + classes];
 
-        let device = logits.device();
-
-        // Compute softmax and log-softmax in one pass (numerically stable).
-        let data = logits.to_vec();
-        let mut softmax = vec![0.0f32; batch_size * num_classes];
-        let mut loss = 0.0f32;
-        for b in 0..batch_size {
-            let off = b * num_classes;
-            let row = &data[off..off + num_classes];
-            let max = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-            let exp_sum: f32 = row.iter().map(|&x| (x - max).exp()).sum();
-            let log_sum_exp = exp_sum.ln();
-            for c in 0..num_classes {
-                softmax[off + c] = (row[c] - max).exp() / exp_sum;
-            }
-            let t = targets[b];
-            assert!(t < num_classes, "Target {} out of range", t);
-            // log_softmax[target] = logits[target] - max - log_sum_exp
-            loss -= row[t] - max - log_sum_exp;
+        // Shift by the row maximum so exp() cannot overflow.
+        let shift = values.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let sum: f32 = values.iter().map(|&v| (v - shift).exp()).sum();
+        for c in 0..classes {
+            softmax[base + c] = (values[c] - shift).exp() / sum;
         }
-        loss /= batch_size as f32;
-
-        // Move softmax and out to logits device BEFORE recording so that ids remain consistent.
-        let softmax_t = Tensor::from_vec(softmax, &[batch_size, num_classes]).to_device(device);
-        let mut out = Tensor::from_vec(vec![loss], &[1]).to_device(device);
-
-        // Record autograd node if tracking active and logits need grad.
-        if graph::is_grad_enabled() && logits.requires_grad() {
-            out.set_requires_grad(true);
-            let grad_fn = Arc::new(CrossEntropyBackward {
-                input_ids: vec![logits.id()],
-                softmax: softmax_t,
-                targets: targets.to_vec(),
-                batch_size,
-                num_classes,
-                device,
-            });
-            graph::record_op_with_cells(
-                grad_fn,
-                out.id(),
-                vec![(logits.id(), logits.grad_cell())],
-            );
-        }
-        out
+        total -= values[target] - shift - sum.ln();
     }
 
-    /// Forward returning both loss and gradient w.r.t. logits.
-    pub fn forward_with_grad(&self, logits: &Tensor, targets: &[usize]) -> (Tensor, Tensor) {
-        let shape = logits.shape();
-        let (batch_size, num_classes) = (shape[0], shape[1]);
-
-        let probs = logits.softmax();
-        let prob_data = probs.to_vec();
-        let log_probs = logits.log_softmax();
-        let log_prob_data = log_probs.to_vec();
-
-        let mut loss = 0.0f32;
-        let mut grad = vec![0.0f32; batch_size * num_classes];
-
-        for (b, &target) in targets.iter().enumerate() {
-            loss -= log_prob_data[b * num_classes + target];
-            for c in 0..num_classes {
-                grad[b * num_classes + c] = (prob_data[b * num_classes + c] - if c == target { 1.0 } else { 0.0 }) / batch_size as f32;
-            }
-        }
-        loss /= batch_size as f32;
-
-        (Tensor::from_vec(vec![loss], &[1]), Tensor::from_vec(grad, &[batch_size, num_classes]))
-    }
+    let saved = Tensor::from_vec(softmax, &[batch, classes]);
+    let targets = targets.to_vec();
+    Tensor::scalar(total / batch as f32)
+        .to(logits.device())
+        .with_grad(&[logits], || CrossEntropyBackward { softmax: saved, targets, classes })
 }
 
-/// Mean Squared Error loss.
-pub struct MSELoss;
-
-impl MSELoss {
-    pub fn new() -> Self { MSELoss }
-
-    pub fn forward(&self, predictions: &Tensor, targets: &Tensor) -> Tensor {
-        let diff = predictions.sub(targets);
-        let sq = diff.mul(&diff);
-        sq.mean()
-    }
-
-    pub fn forward_with_grad(&self, predictions: &Tensor, targets: &Tensor) -> (Tensor, Tensor) {
-        let diff = predictions.sub(targets);
-        let sq = diff.mul(&diff);
-        let loss = sq.mean();
-        let n = predictions.numel() as f32;
-        let grad = diff.mul_scalar(2.0 / n);
-        (loss, grad)
-    }
+/// Mean squared error.
+pub fn mse(prediction: &Tensor, target: &Tensor) -> Tensor {
+    prediction.sub(target).square().mean()
 }
 
-/// Binary Cross-Entropy loss (expects probabilities in [0, 1]).
-pub struct BCELoss;
-
-impl BCELoss {
-    pub fn new() -> Self { BCELoss }
-
-    pub fn forward(&self, predictions: &Tensor, targets: &Tensor) -> Tensor {
-        let eps = 1e-7;
-        let pred = predictions.clamp(eps, 1.0 - eps);
-        let log_p = pred.log();
-        let one = Tensor::ones(predictions.shape());
-        let log_1mp = one.sub(&pred).log();
-
-        // loss = -mean(t * log(p) + (1-t) * log(1-p))
-        let term1 = targets.mul(&log_p);
-        let term2 = one.sub(targets).mul(&log_1mp);
-        term1.add(&term2).neg().mean()
-    }
+/// Mean absolute error. Less sensitive to outliers than [`mse`].
+pub fn mae(prediction: &Tensor, target: &Tensor) -> Tensor {
+    prediction.sub(target).abs().mean()
 }
 
-/// BCE with logits (numerically stable — applies sigmoid internally).
-pub struct BCEWithLogitsLoss;
+/// Binary cross-entropy over probabilities already in `[0, 1]`.
+///
+/// Predictions are clamped away from the endpoints, because `log(0)` is `-inf`
+/// and one saturated output would poison the whole batch. Prefer
+/// [`bce_with_logits`] when you have raw scores.
+pub fn bce(prediction: &Tensor, target: &Tensor) -> Tensor {
+    const EDGE: f32 = 1e-7;
+    let p = prediction.clamp(EDGE, 1.0 - EDGE);
+    let positive = target.mul(&p.log());
+    let negative = target.neg().add_scalar(1.0).mul(&p.neg().add_scalar(1.0).log());
+    positive.add(&negative).neg().mean()
+}
 
-impl BCEWithLogitsLoss {
-    pub fn new() -> Self { BCEWithLogitsLoss }
-
-    pub fn forward(&self, logits: &Tensor, targets: &Tensor) -> Tensor {
-        // Numerically stable: max(x, 0) - x*t + log(1 + exp(-abs(x)))
-        let data = logits.to_vec();
-        let target_data = targets.to_vec();
-        let n = data.len() as f32;
-
-        let loss: f32 = data.iter().zip(target_data.iter()).map(|(&x, &t)| {
-            let max_val = x.max(0.0);
-            max_val - x * t + ((-max_val).exp() + (x - max_val).exp()).ln()
-        }).sum::<f32>() / n;
-
-        Tensor::from_vec(vec![loss], &[1])
-    }
-
-    pub fn forward_with_grad(&self, logits: &Tensor, targets: &Tensor) -> (Tensor, Tensor) {
-        let loss = self.forward(logits, targets);
-        let probs = logits.sigmoid();
-        let n = logits.numel() as f32;
-        let grad = probs.sub(targets).mul_scalar(1.0 / n);
-        (loss, grad)
-    }
+/// Binary cross-entropy straight from logits.
+///
+/// Uses `max(x,0) - x·t + log(1 + e^-|x|)`, which is the same value as
+/// `bce(sigmoid(x), t)` but never exponentiates a large positive number.
+pub fn bce_with_logits(logits: &Tensor, target: &Tensor) -> Tensor {
+    let floor = logits.clamp(0.0, f32::INFINITY);
+    let stable_log = logits.abs().neg().exp().add_scalar(1.0).log();
+    floor.sub(&logits.mul(target)).add(&stable_log).mean()
 }
