@@ -1,0 +1,69 @@
+//! Derivatives of matrix multiplication.
+//!
+//! Each rule is two more multiplications, chosen so that neither needs a
+//! transposed copy of anything — that is the whole reason `matmul_nt` and
+//! `matmul_tn` exist as first-class ops.
+
+use crate::autograd::Backward;
+use crate::tensor::Tensor;
+
+use super::reduce_to;
+
+/// `C = A·B` ⟹ `dA = dC·Bᵀ`, `dB = Aᵀ·dC`.
+pub struct MatmulBackward {
+    pub a: Tensor,
+    pub b: Tensor,
+}
+
+impl Backward for MatmulBackward {
+    fn backward(&self, grad: &Tensor) -> Vec<Tensor> {
+        let d_a = grad.matmul_nt(&self.b);
+        let d_b = self.a.matmul_tn(grad);
+        unbatch(d_a, d_b, &self.a, &self.b)
+    }
+    fn name(&self) -> &'static str {
+        "Matmul"
+    }
+}
+
+/// `C = A·Bᵀ` ⟹ `dA = dC·B`, `dB = dCᵀ·A`.
+pub struct MatmulNtBackward {
+    pub a: Tensor,
+    pub b: Tensor,
+}
+
+impl Backward for MatmulNtBackward {
+    fn backward(&self, grad: &Tensor) -> Vec<Tensor> {
+        let d_a = grad.matmul(&self.b);
+        let d_b = grad.matmul_tn(&self.a);
+        unbatch(d_a, d_b, &self.a, &self.b)
+    }
+    fn name(&self) -> &'static str {
+        "MatmulNt"
+    }
+}
+
+/// `C = Aᵀ·B` ⟹ `dA = B·dCᵀ`, `dB = A·dC`.
+pub struct MatmulTnBackward {
+    pub a: Tensor,
+    pub b: Tensor,
+}
+
+impl Backward for MatmulTnBackward {
+    fn backward(&self, grad: &Tensor) -> Vec<Tensor> {
+        let d_a = self.b.matmul_nt(grad);
+        let d_b = self.a.matmul(grad);
+        unbatch(d_a, d_b, &self.a, &self.b)
+    }
+    fn name(&self) -> &'static str {
+        "MatmulTn"
+    }
+}
+
+/// Sum away any batch dimension the forward pass broadcast over.
+///
+/// A weight matrix multiplied against a batch of inputs is the usual case: its
+/// gradient comes back batched and every sample contributed to it.
+fn unbatch(d_a: Tensor, d_b: Tensor, a: &Tensor, b: &Tensor) -> Vec<Tensor> {
+    vec![reduce_to(&d_a, a.shape()), reduce_to(&d_b, b.shape())]
+}
