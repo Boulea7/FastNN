@@ -22,11 +22,13 @@
 //! 3. Attach it with [`Tensor::with_grad`](crate::tensor::Tensor::with_grad).
 //! 4. Add a finite-difference check in `tests/gradcheck.rs`.
 
+pub mod anomaly;
 pub mod engine;
 pub mod mode;
 pub mod node;
 pub mod ops;
 
+pub use anomaly::{detect_anomaly, is_detecting};
 pub use engine::backward;
 pub use mode::{is_enabled, no_grad};
 pub use node::{Backward, GradSlot, Node, Op};

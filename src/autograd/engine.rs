@@ -40,6 +40,10 @@ pub fn backward(loss: &Tensor) {
         // Rules compute with ordinary tensor ops. Suppressing tracking here means
         // a rule that forgets to detach a saved value still cannot grow a graph.
         let input_grads = super::no_grad(|| op.rule.backward(&grad));
+
+        if super::anomaly::is_detecting() {
+            super::anomaly::check(op.rule.name(), &input_grads);
+        }
         assert_eq!(
             input_grads.len(), op.inputs.len(),
             "{} returned {} gradients for {} inputs",
