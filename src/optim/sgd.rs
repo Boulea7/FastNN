@@ -1,9 +1,11 @@
 //! Stochastic gradient descent.
 
+use crate::error::Result;
 use crate::nn::Param;
 use crate::tensor::Tensor;
 
-use super::Optimizer;
+use super::state::place;
+use super::{Optimizer, OptimizerState};
 
 /// Plain SGD, optionally with momentum, Nesterov lookahead, and weight decay.
 ///
@@ -22,6 +24,7 @@ pub struct SGD {
     dampening: f32,
     weight_decay: f32,
     nesterov: bool,
+    steps: u64,
 }
 
 impl SGD {
@@ -34,6 +37,7 @@ impl SGD {
             dampening: 0.0,
             weight_decay: 0.0,
             nesterov: false,
+            steps: 0,
         }
     }
 
@@ -65,7 +69,11 @@ impl SGD {
 
 impl Optimizer for SGD {
     fn step(&mut self) {
+        self.steps += 1;
         for (index, param) in self.params.iter().enumerate() {
+            if !param.is_trainable() {
+                continue;
+            }
             let Some(grad) = param.grad() else { continue };
             let value = param.value();
 
@@ -106,5 +114,17 @@ impl Optimizer for SGD {
 
     fn set_lr(&mut self, lr: f32) {
         self.lr = lr;
+    }
+
+    fn state(&self) -> OptimizerState {
+        let mut state = OptimizerState::new(self.steps);
+        state.put("velocity", &self.velocity);
+        state
+    }
+
+    fn load_state(&mut self, state: OptimizerState) -> Result<()> {
+        self.velocity = place(state.take("velocity", self.params.len())?, &self.params);
+        self.steps = state.steps;
+        Ok(())
     }
 }

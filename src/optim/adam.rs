@@ -1,9 +1,11 @@
 //! Adam and AdamW.
 
+use crate::error::Result;
 use crate::nn::Param;
 use crate::tensor::Tensor;
 
-use super::Optimizer;
+use super::state::place;
+use super::{Optimizer, OptimizerState};
 
 /// The moment estimates and update rule both optimizers share.
 struct Moments {
@@ -12,7 +14,7 @@ struct Moments {
     beta1: f32,
     beta2: f32,
     eps: f32,
-    steps: u32,
+    steps: u64,
 }
 
 impl Moments {
@@ -44,6 +46,20 @@ impl Moments {
         self.first[index] = Some(first);
         self.second[index] = Some(second);
         mean.div(&scale)
+    }
+
+    fn save(&self) -> OptimizerState {
+        let mut state = OptimizerState::new(self.steps);
+        state.put("moment1", &self.first);
+        state.put("moment2", &self.second);
+        state
+    }
+
+    fn restore(&mut self, state: OptimizerState, params: &[Param]) -> Result<()> {
+        self.first = place(state.take("moment1", params.len())?, params);
+        self.second = place(state.take("moment2", params.len())?, params);
+        self.steps = state.steps;
+        Ok(())
     }
 }
 
@@ -100,6 +116,9 @@ impl Optimizer for Adam {
     fn step(&mut self) {
         self.moments.steps += 1;
         for (index, param) in self.params.iter().enumerate() {
+            if !param.is_trainable() {
+                continue;
+            }
             let Some(grad) = param.grad() else { continue };
             let value = param.value();
 
@@ -124,6 +143,14 @@ impl Optimizer for Adam {
 
     fn set_lr(&mut self, lr: f32) {
         self.lr = lr;
+    }
+
+    fn state(&self) -> OptimizerState {
+        self.moments.save()
+    }
+
+    fn load_state(&mut self, state: OptimizerState) -> Result<()> {
+        self.moments.restore(state, &self.params)
     }
 }
 
@@ -166,6 +193,9 @@ impl Optimizer for AdamW {
     fn step(&mut self) {
         self.moments.steps += 1;
         for (index, param) in self.params.iter().enumerate() {
+            if !param.is_trainable() {
+                continue;
+            }
             let Some(grad) = param.grad() else { continue };
 
             // Shrink the weight first, untouched by the moment estimates.
@@ -185,5 +215,13 @@ impl Optimizer for AdamW {
 
     fn set_lr(&mut self, lr: f32) {
         self.lr = lr;
+    }
+
+    fn state(&self) -> OptimizerState {
+        self.moments.save()
+    }
+
+    fn load_state(&mut self, state: OptimizerState) -> Result<()> {
+        self.moments.restore(state, &self.params)
     }
 }

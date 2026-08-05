@@ -24,11 +24,14 @@
 pub mod adam;
 pub mod schedule;
 pub mod sgd;
+pub mod state;
 
 pub use adam::{Adam, AdamW};
 pub use schedule::{CosineAnnealing, Constant, LrSchedule, OneCycle, StepDecay, Warmup};
 pub use sgd::SGD;
+pub use state::OptimizerState;
 
+use crate::error::Result;
 use crate::nn::Param;
 
 /// What every optimizer can do.
@@ -48,12 +51,36 @@ pub trait Optimizer {
     /// Set the learning rate — how a [`LrSchedule`] is applied.
     fn set_lr(&mut self, lr: f32);
 
+    /// Momentum, moment estimates, and step count, ready to be written to disk.
+    ///
+    /// Use [`save_training`](crate::serialize::save_training) rather than calling
+    /// this directly unless you are storing the state somewhere of your own.
+    fn state(&self) -> OptimizerState;
+
+    /// Restore what [`state`](Optimizer::state) captured.
+    fn load_state(&mut self, state: OptimizerState) -> Result<()>;
+
     /// Clear every gradient. Call before `backward()`, or skip it to accumulate
     /// gradients across several micro-batches.
     fn zero_grad(&self) {
         for param in self.parameters() {
             param.zero_grad();
         }
+    }
+
+    /// Whether every parameter's gradient is finite.
+    ///
+    /// A cheap guard before `step()`: one inf in one gradient becomes an inf
+    /// weight, and from there every activation downstream is NaN. Skipping the
+    /// step costs one batch; taking it costs the run.
+    ///
+    /// Reads every gradient, so on a GPU this downloads them. Worth it around a
+    /// known-unstable phase; not worth it every step of a healthy run.
+    fn gradients_are_finite(&self) -> bool {
+        self.parameters()
+            .iter()
+            .filter_map(|p| p.grad())
+            .all(|g| g.is_finite())
     }
 }
 
