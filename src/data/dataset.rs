@@ -1,83 +1,92 @@
-use crate::tensor::Tensor;
+//! The dataset trait and simple in-memory implementations.
 
-/// Trait for datasets — provides indexed access to samples.
+use crate::tensor::{shape, Tensor};
+
+/// A finite, indexable collection of `(input, target)` pairs.
+///
+/// Items are written into caller-provided slices rather than returned as
+/// tensors. A [`DataLoader`](super::DataLoader) allocates one buffer per batch
+/// and fills it, so batching a dataset of 60,000 images does not build 60,000
+/// throwaway tensors.
 pub trait Dataset: Send + Sync {
-    /// Number of samples in the dataset.
+    /// Number of items.
     fn len(&self) -> usize;
 
-    fn is_empty(&self) -> bool { self.len() == 0 }
+    /// Shape of one input, without a batch dimension.
+    fn input_shape(&self) -> Vec<usize>;
 
-    /// Get a single sample: (input, target).
-    fn get(&self, index: usize) -> (Tensor, Tensor);
+    /// Shape of one target, without a batch dimension. `[1]` for a class label.
+    fn target_shape(&self) -> Vec<usize>;
+
+    /// Copy item `index` into the slices, which are exactly one item wide.
+    fn write(&self, index: usize, input: &mut [f32], target: &mut [f32]);
+
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Elements in one input.
+    fn input_size(&self) -> usize {
+        shape::numel(&self.input_shape())
+    }
+
+    /// Elements in one target.
+    fn target_size(&self) -> usize {
+        shape::numel(&self.target_shape())
+    }
 }
 
-/// In-memory dataset backed by tensors.
+/// A dataset held entirely in two tensors, batched along dimension 0.
 pub struct TensorDataset {
-    inputs: Tensor,
-    targets: Tensor,
+    inputs: Vec<f32>,
+    targets: Vec<f32>,
+    input_shape: Vec<usize>,
+    target_shape: Vec<usize>,
+    len: usize,
 }
 
 impl TensorDataset {
-    /// Create from full input and target tensors.
-    /// Both tensors must have the same first dimension (batch size).
-    pub fn new(inputs: Tensor, targets: Tensor) -> Self {
-        assert_eq!(inputs.shape()[0], targets.shape()[0],
-                   "Input and target batch sizes must match");
-        TensorDataset { inputs, targets }
+    /// Both tensors must agree on their first dimension.
+    pub fn new(inputs: &Tensor, targets: &Tensor) -> TensorDataset {
+        assert_eq!(
+            inputs.dim(0), targets.dim(0),
+            "TensorDataset: {} inputs but {} targets", inputs.dim(0), targets.dim(0)
+        );
+        TensorDataset {
+            len: inputs.dim(0),
+            input_shape: item_shape(inputs),
+            target_shape: item_shape(targets),
+            inputs: inputs.to_vec(),
+            targets: targets.to_vec(),
+        }
     }
 }
 
 impl Dataset for TensorDataset {
     fn len(&self) -> usize {
-        self.inputs.shape()[0]
+        self.len
     }
 
-    fn get(&self, index: usize) -> (Tensor, Tensor) {
-        let input_data = self.inputs.to_vec();
-        let target_data = self.targets.to_vec();
+    fn input_shape(&self) -> Vec<usize> {
+        self.input_shape.clone()
+    }
 
-        let input_sample_size: usize = self.inputs.shape()[1..].iter().product();
-        let target_sample_size: usize = if self.targets.ndim() > 1 {
-            self.targets.shape()[1..].iter().product()
-        } else {
-            1
-        };
+    fn target_shape(&self) -> Vec<usize> {
+        self.target_shape.clone()
+    }
 
-        let input_start = index * input_sample_size;
-        let input_vec = input_data[input_start..input_start + input_sample_size].to_vec();
-        let input_shape: Vec<usize> = self.inputs.shape()[1..].to_vec();
-
-        let target_start = index * target_sample_size;
-        let target_vec = target_data[target_start..target_start + target_sample_size].to_vec();
-        let target_shape: Vec<usize> = if self.targets.ndim() > 1 {
-            self.targets.shape()[1..].to_vec()
-        } else {
-            vec![1]
-        };
-
-        (
-            Tensor::from_vec(input_vec, &input_shape),
-            Tensor::from_vec(target_vec, &target_shape),
-        )
+    fn write(&self, index: usize, input: &mut [f32], target: &mut [f32]) {
+        copy_item(&self.inputs, index, input);
+        copy_item(&self.targets, index, target);
     }
 }
 
-/// Dataset from a vector of (input, target) pairs.
-pub struct VecDataset {
-    samples: Vec<(Tensor, Tensor)>,
+/// Everything after the batch dimension, or `[1]` for a flat tensor of labels.
+fn item_shape(t: &Tensor) -> Vec<usize> {
+    if t.ndim() <= 1 { vec![1] } else { t.shape()[1..].to_vec() }
 }
 
-impl VecDataset {
-    pub fn new(samples: Vec<(Tensor, Tensor)>) -> Self {
-        VecDataset { samples }
-    }
-}
-
-impl Dataset for VecDataset {
-    fn len(&self) -> usize { self.samples.len() }
-
-    fn get(&self, index: usize) -> (Tensor, Tensor) {
-        let (input, target) = &self.samples[index];
-        (input.clone(), target.clone())
-    }
+fn copy_item(source: &[f32], index: usize, out: &mut [f32]) {
+    let start = index * out.len();
+    out.copy_from_slice(&source[start..start + out.len()]);
 }
