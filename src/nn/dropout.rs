@@ -1,37 +1,52 @@
-use crate::tensor::Tensor;
-use crate::nn::module::Module;
+//! Dropout regularization.
 
-/// Dropout regularization layer.
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use crate::rng;
+use crate::tensor::Tensor;
+
+use super::module::Module;
+
+/// Zero each element with probability `p` during training, scaling the survivors
+/// by `1/(1-p)` so the expected activation is unchanged.
+///
+/// That rescaling is what lets eval mode be a no-op: the network sees the same
+/// average signal either way. Implemented as a multiply by a random mask, so the
+/// gradient is routed to exactly the units that survived.
 pub struct Dropout {
-    pub p: f32,
-    training: bool,
+    p: f32,
+    training: AtomicBool,
 }
 
 impl Dropout {
-    pub fn new(p: f32) -> Self {
-        assert!(p >= 0.0 && p < 1.0, "Dropout probability must be in [0, 1)");
-        Dropout { p, training: true }
+    /// Panics unless `p` is in `[0, 1)` — `p = 1` would zero everything.
+    pub fn new(p: f32) -> Dropout {
+        assert!((0.0..1.0).contains(&p), "dropout probability must be in [0, 1), got {p}");
+        Dropout { p, training: AtomicBool::new(true) }
+    }
+
+    pub fn probability(&self) -> f32 {
+        self.p
     }
 }
 
 impl Module for Dropout {
     fn forward(&self, input: &Tensor) -> Tensor {
-        if !self.training || self.p == 0.0 {
+        if self.p == 0.0 || !self.training.load(Ordering::Relaxed) {
             return input.clone();
         }
 
-        use rand::Rng;
-        let data = input.to_vec();
-        let mut rng = rand::thread_rng();
-        let scale = 1.0 / (1.0 - self.p);
-        let result: Vec<f32> = data.iter().map(|&x| {
-            if rng.gen::<f32>() > self.p { x * scale } else { 0.0 }
-        }).collect();
+        let keep = 1.0 - self.p;
+        let scale = 1.0 / keep;
+        let mask: Vec<f32> = rng::bernoulli(input.numel(), keep)
+            .into_iter()
+            .map(|kept| if kept { scale } else { 0.0 })
+            .collect();
 
-        Tensor::from_vec(result, input.shape()).to_device(input.device())
+        input.mul(&Tensor::from_vec(mask, input.shape()).to(input.device()))
     }
 
-    fn train(&mut self) { self.training = true; }
-    fn eval(&mut self) { self.training = false; }
-    fn is_training(&self) -> bool { self.training }
+    fn set_training(&self, training: bool) {
+        self.training.store(training, Ordering::Relaxed);
+    }
 }

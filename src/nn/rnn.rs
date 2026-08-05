@@ -1,212 +1,194 @@
-use crate::tensor::Tensor;
-use crate::nn::module::Module;
+//! Recurrent layers.
+//!
+//! Both cells are written with ordinary differentiable tensor ops, so they train
+//! through backpropagation-through-time with no gradient code of their own. The
+//! cost is one graph node per gate per timestep: correct, and fine for short
+//! sequences, but a transformer will be far faster on long ones.
+//!
+//! Each layer is single-layer and unidirectional. Stack them in a
+//! [`Sequential`](super::Sequential) — the `[batch, sequence, hidden]` output
+//! feeds straight into the next.
 
-/// Long Short-Term Memory (LSTM) layer.
-pub struct LSTM {
-    // Gates: input, forget, cell, output — combined into one weight matrix for efficiency
-    pub weight_ih: Tensor, // [4 * hidden_size, input_size]
-    pub weight_hh: Tensor, // [4 * hidden_size, hidden_size]
-    pub bias_ih: Tensor,   // [4 * hidden_size]
-    pub bias_hh: Tensor,   // [4 * hidden_size]
-    input_size: usize,
-    hidden_size: usize,
-    num_layers: usize,
+use crate::tensor::Tensor;
+
+use super::module::Module;
+use super::param::Param;
+
+/// The four weight tensors every gated recurrent cell has.
+struct Gates {
+    input_weight: Param,
+    hidden_weight: Param,
+    input_bias: Param,
+    hidden_bias: Param,
 }
 
-impl LSTM {
-    pub fn new(input_size: usize, hidden_size: usize, num_layers: usize) -> Self {
-        let gate_size = 4 * hidden_size;
-        let mut weight_ih = Tensor::xavier_uniform(&[gate_size, input_size], input_size, hidden_size);
-        weight_ih.set_requires_grad(true);
-        let mut weight_hh = Tensor::xavier_uniform(&[gate_size, hidden_size], hidden_size, hidden_size);
-        weight_hh.set_requires_grad(true);
-        let mut bias_ih = Tensor::zeros(&[gate_size]);
-        bias_ih.set_requires_grad(true);
-        let mut bias_hh = Tensor::zeros(&[gate_size]);
-        bias_hh.set_requires_grad(true);
-
-        // Initialize forget gate bias to 1.0 (helps training)
-        {
-            let b = bias_ih.data_mut();
-            for i in hidden_size..2 * hidden_size {
-                b[i] = 1.0;
-            }
-        }
-
-        LSTM {
-            weight_ih, weight_hh, bias_ih, bias_hh,
-            input_size, hidden_size, num_layers,
+impl Gates {
+    /// `count` gates of `hidden` units each, over an `input`-wide input.
+    fn new(input: usize, hidden: usize, count: usize) -> Gates {
+        let width = count * hidden;
+        Gates {
+            input_weight: Param::new(Tensor::xavier_uniform(&[width, input], input, hidden)),
+            hidden_weight: Param::new(Tensor::xavier_uniform(&[width, hidden], hidden, hidden)),
+            input_bias: Param::new(Tensor::zeros(&[width])),
+            hidden_bias: Param::new(Tensor::zeros(&[width])),
         }
     }
 
-    /// Forward pass. Returns (output, (h_n, c_n)).
-    /// input: [batch, seq_len, input_size]
-    /// Returns output: [batch, seq_len, hidden_size]
-    pub fn forward_seq(&self, input: &Tensor, initial_state: Option<(&Tensor, &Tensor)>) -> (Tensor, Tensor, Tensor) {
-        let shape = input.shape();
-        let (batch, seq_len, _) = (shape[0], shape[1], shape[2]);
+    /// `x · W_ihᵀ + b_ih` and `h · W_hhᵀ + b_hh`, each `[batch, count·hidden]`.
+    fn project(&self, x: &Tensor, h: &Tensor) -> (Tensor, Tensor) {
+        let from_input = x.matmul_nt(&self.input_weight.tensor()).add(&self.input_bias.tensor());
+        let from_hidden = h.matmul_nt(&self.hidden_weight.tensor()).add(&self.hidden_bias.tensor());
+        (from_input, from_hidden)
+    }
 
-        let mut h = if let Some((h0, _)) = initial_state {
-            h0.clone()
-        } else {
-            Tensor::zeros(&[batch, self.hidden_size])
+    fn named_parameters(&self) -> Vec<(String, Param)> {
+        vec![
+            ("input_weight".into(), self.input_weight.clone()),
+            ("hidden_weight".into(), self.hidden_weight.clone()),
+            ("input_bias".into(), self.input_bias.clone()),
+            ("hidden_bias".into(), self.hidden_bias.clone()),
+        ]
+    }
+}
+
+/// Long short-term memory.
+///
+/// Carries a cell state alongside the hidden state; the forget gate multiplies
+/// it rather than replacing it, which is what keeps gradients alive over long
+/// spans.
+pub struct LSTM {
+    gates: Gates,
+    input_size: usize,
+    hidden_size: usize,
+}
+
+impl LSTM {
+    pub fn new(input_size: usize, hidden_size: usize) -> LSTM {
+        let gates = Gates::new(input_size, hidden_size, 4);
+        // Start the forget gate open. At zero bias the sigmoid sits at 0.5 and
+        // halves the cell state every step, so early gradients vanish before the
+        // model has learned what to keep.
+        let mut bias = gates.input_bias.value().to_vec();
+        bias[hidden_size..2 * hidden_size].fill(1.0);
+        gates.input_bias.set_value(Tensor::from_vec(bias, &[4 * hidden_size]));
+
+        LSTM { gates, input_size, hidden_size }
+    }
+
+    /// Run over `[batch, sequence, input_size]`.
+    ///
+    /// Returns the per-step outputs `[batch, sequence, hidden_size]` plus the
+    /// final hidden and cell states.
+    pub fn run(&self, input: &Tensor, initial: Option<(&Tensor, &Tensor)>) -> (Tensor, Tensor, Tensor) {
+        let (batch, steps) = check_sequence(input, self.input_size, "LSTM");
+        let zeros = || Tensor::zeros(&[batch, self.hidden_size]).to(input.device());
+        let (mut h, mut c) = match initial {
+            Some((h0, c0)) => (h0.clone(), c0.clone()),
+            None => (zeros(), zeros()),
         };
 
-        let mut c = if let Some((_, c0)) = initial_state {
-            c0.clone()
-        } else {
-            Tensor::zeros(&[batch, self.hidden_size])
-        };
+        let mut outputs = Vec::with_capacity(steps);
+        for t in 0..steps {
+            let x = step_input(input, t, batch, self.input_size);
+            let (from_input, from_hidden) = self.gates.project(&x, &h);
+            let gates = from_input.add(&from_hidden);
 
-        let mut outputs = Vec::with_capacity(seq_len);
-        let hs = self.hidden_size;
+            let slice = |index: usize| gates.narrow(1, index * self.hidden_size, self.hidden_size);
+            let input_gate = slice(0).sigmoid();
+            let forget_gate = slice(1).sigmoid();
+            let candidate = slice(2).tanh();
+            let output_gate = slice(3).sigmoid();
 
-        for t in 0..seq_len {
-            // Extract input at time t: [batch, input_size]
-            let x_t_data: Vec<f32> = (0..batch).flat_map(|b| {
-                let offset = (b * seq_len + t) * self.input_size;
-                input.to_vec()[offset..offset + self.input_size].to_vec()
-            }).collect();
-            let x_t = Tensor::from_vec(x_t_data, &[batch, self.input_size]);
-
-            // gates = x_t @ W_ih^T + h @ W_hh^T + b_ih + b_hh
-            let gates_i = x_t.matmul(&self.weight_ih.transpose());
-            let gates_h = h.matmul(&self.weight_hh.transpose());
-            let bias = self.bias_ih.reshape(&[1, 4 * hs as i64]).expand(&[batch, 4 * hs]);
-            let bias2 = self.bias_hh.reshape(&[1, 4 * hs as i64]).expand(&[batch, 4 * hs]);
-            let gates = gates_i.add(&gates_h).add(&bias).add(&bias2);
-
-            let gates_data = gates.to_vec();
-            let mut new_h = vec![0.0f32; batch * hs];
-            let mut new_c = vec![0.0f32; batch * hs];
-            let c_data = c.to_vec();
-
-            for b in 0..batch {
-                for j in 0..hs {
-                    let i_gate = sigmoid(gates_data[b * 4 * hs + j]);
-                    let f_gate = sigmoid(gates_data[b * 4 * hs + hs + j]);
-                    let g_gate = gates_data[b * 4 * hs + 2 * hs + j].tanh();
-                    let o_gate = sigmoid(gates_data[b * 4 * hs + 3 * hs + j]);
-
-                    new_c[b * hs + j] = f_gate * c_data[b * hs + j] + i_gate * g_gate;
-                    new_h[b * hs + j] = o_gate * new_c[b * hs + j].tanh();
-                }
-            }
-
-            h = Tensor::from_vec(new_h, &[batch, hs]);
-            c = Tensor::from_vec(new_c, &[batch, hs]);
+            c = forget_gate.mul(&c).add(&input_gate.mul(&candidate));
+            h = output_gate.mul(&c.tanh());
             outputs.push(h.clone());
         }
 
-        // Stack outputs: [batch, seq_len, hidden_size]
-        let output_data: Vec<f32> = (0..batch).flat_map(|b| {
-            (0..seq_len).flat_map(|t| {
-                outputs[t].to_vec()[b * hs..(b + 1) * hs].to_vec()
-            }).collect::<Vec<f32>>()
-        }).collect();
-
-        let output = Tensor::from_vec(output_data, &[batch, seq_len, hs]);
-        (output, h, c)
+        (stack_steps(&outputs), h, c)
     }
 }
 
 impl Module for LSTM {
     fn forward(&self, input: &Tensor) -> Tensor {
-        let (output, _, _) = self.forward_seq(input, None);
-        output
+        self.run(input, None).0
     }
 
-    fn parameters(&self) -> Vec<Tensor> {
-        vec![self.weight_ih.clone(), self.weight_hh.clone(), self.bias_ih.clone(), self.bias_hh.clone()]
+    fn named_parameters(&self) -> Vec<(String, Param)> {
+        self.gates.named_parameters()
     }
 }
 
-/// Gated Recurrent Unit (GRU) layer.
+/// Gated recurrent unit — LSTM's gating with no separate cell state.
 pub struct GRU {
-    pub weight_ih: Tensor, // [3 * hidden_size, input_size]
-    pub weight_hh: Tensor, // [3 * hidden_size, hidden_size]
-    pub bias_ih: Tensor,
-    pub bias_hh: Tensor,
+    gates: Gates,
     input_size: usize,
     hidden_size: usize,
 }
 
 impl GRU {
-    pub fn new(input_size: usize, hidden_size: usize) -> Self {
-        let gate_size = 3 * hidden_size;
-        let mut weight_ih = Tensor::xavier_uniform(&[gate_size, input_size], input_size, hidden_size);
-        weight_ih.set_requires_grad(true);
-        let mut weight_hh = Tensor::xavier_uniform(&[gate_size, hidden_size], hidden_size, hidden_size);
-        weight_hh.set_requires_grad(true);
-        let mut bias_ih = Tensor::zeros(&[gate_size]);
-        bias_ih.set_requires_grad(true);
-        let mut bias_hh = Tensor::zeros(&[gate_size]);
-        bias_hh.set_requires_grad(true);
-
-        GRU { weight_ih, weight_hh, bias_ih, bias_hh, input_size, hidden_size }
+    pub fn new(input_size: usize, hidden_size: usize) -> GRU {
+        GRU { gates: Gates::new(input_size, hidden_size, 3), input_size, hidden_size }
     }
 
-    pub fn forward_seq(&self, input: &Tensor, h0: Option<&Tensor>) -> (Tensor, Tensor) {
-        let shape = input.shape();
-        let (batch, seq_len, _) = (shape[0], shape[1], shape[2]);
-        let hs = self.hidden_size;
+    /// Run over `[batch, sequence, input_size]`, returning the outputs and the
+    /// final hidden state.
+    pub fn run(&self, input: &Tensor, initial: Option<&Tensor>) -> (Tensor, Tensor) {
+        let (batch, steps) = check_sequence(input, self.input_size, "GRU");
+        let mut h = initial
+            .cloned()
+            .unwrap_or_else(|| Tensor::zeros(&[batch, self.hidden_size]).to(input.device()));
 
-        let mut h = h0.cloned().unwrap_or_else(|| Tensor::zeros(&[batch, hs]));
-        let mut outputs = Vec::with_capacity(seq_len);
+        let mut outputs = Vec::with_capacity(steps);
+        for t in 0..steps {
+            let x = step_input(input, t, batch, self.input_size);
+            let (from_input, from_hidden) = self.gates.project(&x, &h);
 
-        for t in 0..seq_len {
-            let x_t_data: Vec<f32> = (0..batch).flat_map(|b| {
-                let offset = (b * seq_len + t) * self.input_size;
-                input.to_vec()[offset..offset + self.input_size].to_vec()
-            }).collect();
-            let x_t = Tensor::from_vec(x_t_data, &[batch, self.input_size]);
+            let part = |source: &Tensor, index: usize| {
+                source.narrow(1, index * self.hidden_size, self.hidden_size)
+            };
+            let reset = part(&from_input, 0).add(&part(&from_hidden, 0)).sigmoid();
+            let update = part(&from_input, 1).add(&part(&from_hidden, 1)).sigmoid();
+            // The reset gate scales the *hidden* contribution only, letting the
+            // candidate ignore history without ignoring the current input.
+            let candidate = part(&from_input, 2).add(&reset.mul(&part(&from_hidden, 2))).tanh();
 
-            let gates_i = x_t.matmul(&self.weight_ih.transpose());
-            let gates_h = h.matmul(&self.weight_hh.transpose());
-            let bi = self.bias_ih.reshape(&[1, 3 * hs as i64]).expand(&[batch, 3 * hs]);
-            let bh = self.bias_hh.reshape(&[1, 3 * hs as i64]).expand(&[batch, 3 * hs]);
-
-            let gi = gates_i.add(&bi).to_vec();
-            let gh = gates_h.add(&bh).to_vec();
-            let h_data = h.to_vec();
-
-            let mut new_h = vec![0.0f32; batch * hs];
-            for b in 0..batch {
-                for j in 0..hs {
-                    let r = sigmoid(gi[b * 3 * hs + j] + gh[b * 3 * hs + j]);
-                    let z = sigmoid(gi[b * 3 * hs + hs + j] + gh[b * 3 * hs + hs + j]);
-                    let n = (gi[b * 3 * hs + 2 * hs + j] + r * gh[b * 3 * hs + 2 * hs + j]).tanh();
-                    new_h[b * hs + j] = (1.0 - z) * n + z * h_data[b * hs + j];
-                }
-            }
-
-            h = Tensor::from_vec(new_h, &[batch, hs]);
+            let keep = update.neg().add_scalar(1.0);
+            h = keep.mul(&candidate).add(&update.mul(&h));
             outputs.push(h.clone());
         }
 
-        let output_data: Vec<f32> = (0..batch).flat_map(|b| {
-            (0..seq_len).flat_map(|t| {
-                outputs[t].to_vec()[b * hs..(b + 1) * hs].to_vec()
-            }).collect::<Vec<f32>>()
-        }).collect();
-
-        let output = Tensor::from_vec(output_data, &[batch, seq_len, hs]);
-        (output, h)
+        (stack_steps(&outputs), h)
     }
 }
 
 impl Module for GRU {
     fn forward(&self, input: &Tensor) -> Tensor {
-        let (output, _) = self.forward_seq(input, None);
-        output
+        self.run(input, None).0
     }
 
-    fn parameters(&self) -> Vec<Tensor> {
-        vec![self.weight_ih.clone(), self.weight_hh.clone(), self.bias_ih.clone(), self.bias_hh.clone()]
+    fn named_parameters(&self) -> Vec<(String, Param)> {
+        self.gates.named_parameters()
     }
 }
 
-#[inline]
-fn sigmoid(x: f32) -> f32 {
-    1.0 / (1.0 + (-x).exp())
+fn check_sequence(input: &Tensor, input_size: usize, layer: &str) -> (usize, usize) {
+    assert_eq!(
+        input.ndim(), 3,
+        "{layer} expects [batch, sequence, features], got {:?}", input.shape()
+    );
+    assert_eq!(
+        input.dim(2), input_size,
+        "{layer} expects {input_size} features, got {:?}", input.shape()
+    );
+    (input.dim(0), input.dim(1))
+}
+
+/// Timestep `t` as `[batch, features]`.
+fn step_input(input: &Tensor, t: usize, batch: usize, features: usize) -> Tensor {
+    input.narrow(1, t, 1).reshape(&[batch as i64, features as i64])
+}
+
+/// Per-step `[batch, hidden]` outputs into `[batch, sequence, hidden]`.
+fn stack_steps(steps: &[Tensor]) -> Tensor {
+    Tensor::stack(&steps.iter().collect::<Vec<_>>(), 1)
 }
