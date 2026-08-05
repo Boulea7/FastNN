@@ -26,15 +26,23 @@ unsafe impl Sync for CudaBuffer {}
 
 impl CudaBuffer {
     /// Allocate `len` floats, reusing a cached block when one is free.
+    ///
+    /// On failure the free list is drained and the allocation retried once. The
+    /// cache holds blocks of every size that has ever been asked for, so a run
+    /// that changes shape — a final short batch, a longer sequence — can be
+    /// holding plenty of memory in the wrong size classes. Returning them to the
+    /// driver turns many would-be out-of-memory failures into a pause.
     pub fn new(len: usize) -> Result<Self> {
         if let Some(ptr) = cache::take(len) {
             return Ok(CudaBuffer { ptr, len });
         }
-        let mut ptr: *mut f32 = std::ptr::null_mut();
-        check(unsafe { ffi::fastnn_cuda_malloc(&mut ptr, len * F32) }, || {
-            format!("failed to allocate {} bytes", len * F32)
-        })?;
-        Ok(CudaBuffer { ptr, len })
+        match raw_alloc(len) {
+            Ok(ptr) => Ok(CudaBuffer { ptr, len }),
+            Err(_) => {
+                cache::drain();
+                raw_alloc(len).map(|ptr| CudaBuffer { ptr, len })
+            }
+        }
     }
 
     /// Allocate `len` floats set to zero.
@@ -125,6 +133,16 @@ fn check(code: std::ffi::c_int, msg: impl FnOnce() -> String) -> Result<()> {
     if code == 0 { Ok(()) } else { Err(Error::Cuda(msg())) }
 }
 
+/// One `cudaMalloc`, with no cache involved.
+fn raw_alloc(len: usize) -> Result<*mut f32> {
+    let mut ptr: *mut f32 = std::ptr::null_mut();
+    check(unsafe { ffi::fastnn_cuda_malloc(&mut ptr, len * F32) }, || {
+        let (free, total) = super::memory_info();
+        format!("out of memory: wanted {} bytes, {free} of {total} free", len * F32)
+    })?;
+    Ok(ptr)
+}
+
 /// Free list of GPU blocks, keyed by element count.
 ///
 /// Every kernel runs on the default stream, which is ordered: a kernel launched
@@ -160,7 +178,7 @@ mod cache {
     }
 
     /// Hand every cached block back to the driver.
-    pub fn drain() {
+    pub(super) fn drain() {
         let Ok(mut guard) = FREE_LIST.lock() else { return };
         if let Some(map) = guard.as_mut() {
             for (_, blocks) in map.drain() {
