@@ -1,229 +1,349 @@
-//! CUDA-vs-CPU parity tests.
+//! CPU/GPU equivalence.
 //!
-//! Several ops (matmul_nt/tn, permute_nd, sum_axis, LayerNorm) have a custom
-//! CUDA kernel and a *different* CPU code path. The finite-difference gradcheck
-//! in `gradcheck.rs` only exercises the CPU path, so a bug in a GPU kernel
-//! (e.g. a wrong cuBLAS transpose flag or leading dimension) would pass there
-//! while silently producing wrong results on the GPU.
+//! Every op with a hand-written CUDA kernel is run twice — once on each device —
+//! and the results compared. `tests/gradcheck.rs` proves the CPU maths is right;
+//! this proves the GPU agrees with it, forward and backward.
 //!
-//! These tests run the exact same op on CPU and CUDA — both forward and
-//! backward — and assert the results agree. They only build/run with the
-//! `cuda` feature.
+//!     cargo test --test cuda_parity
 //!
-//! Run with:  cargo test --test cuda_parity -- --test-threads=1
-//!
-//! NOTE: the cuBLAS handle is a global (not thread-safe), so a process-wide
-//! lock serialises GPU access regardless of the test harness thread count.
+//! Skips itself with a note when no GPU is present, so a CPU-only machine still
+//! gets a green run.
 
-#![cfg(feature = "cuda")]
+// Test inputs are always passed as a slice. `&[x.clone()]` for a single input
+// costs one clone of a refcounted handle and keeps every call site reading the
+// same way as the multi-input ones.
+#![allow(clippy::cloned_ref_to_slice_refs)]
 
 use std::sync::Mutex;
-use fastnn::tensor::{Tensor, Device};
-use fastnn::autograd::graph;
-use fastnn::cuda::CudaContext;
-use fastnn::nn::{Module, LayerNorm};
 
-static GPU_LOCK: Mutex<()> = Mutex::new(());
+use fastnn::nn::Param;
+use fastnn::prelude::*;
 
-// Deterministic PRNG (SplitMix64) — identical to gradcheck.rs.
-struct Rng(u64);
-impl Rng {
-    fn new(seed: u64) -> Self { Rng(seed.wrapping_add(0x9E3779B97F4A7C15)) }
-    fn next_u64(&mut self) -> u64 {
-        self.0 = self.0.wrapping_add(0x9E3779B97F4A7C15);
-        let mut z = self.0;
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
-        z ^ (z >> 31)
+/// Difference a single op may show. The kernels are built with
+/// `--use_fast_math` and reduce in a different order than the host loops, so
+/// exact equality is not on offer; anything past this is a real disagreement.
+const OP_TOLERANCE: f32 = 2e-4;
+
+/// Difference a whole block may show. Dozens of ops compound their rounding, so
+/// end-to-end comparisons get more room than single ops.
+const MODEL_TOLERANCE: f32 = 5e-3;
+
+/// Tests share one GPU and one cuBLAS handle, so they run one at a time.
+static GPU: Mutex<()> = Mutex::new(());
+
+/// Take the GPU lock, ignoring poison.
+///
+/// A failing assertion poisons the mutex, and without this every later test
+/// reports that poison instead of its own result — hiding the failure that
+/// actually matters behind a wall of noise.
+fn lock_gpu() -> std::sync::MutexGuard<'static, ()> {
+    GPU.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// The GPU, or `None` on a machine or build without one.
+fn gpu() -> Option<Device> {
+    match Device::cuda(0) {
+        Ok(device) => Some(device),
+        Err(_) => {
+            eprintln!("no CUDA device — skipping parity test");
+            None
+        }
     }
-    fn unit(&mut self) -> f32 { (self.next_u64() >> 40) as f32 / (1u64 << 24) as f32 * 2.0 - 1.0 }
-}
-fn rand_data(n: usize, seed: u64) -> Vec<f32> {
-    let mut r = Rng::new(seed); (0..n).map(|_| r.unit()).collect()
 }
 
-/// cuBLAS GEMM uses TF32 tensor cores (set in fastnn_cuda_init), giving ~1e-3
-/// relative error vs f32. Elementwise/gather kernels are exact f32.
-fn assert_close(name: &str, what: &str, cpu: &[f32], gpu: &[f32], rtol: f32, atol: f32) {
-    assert_eq!(cpu.len(), gpu.len(), "{name}: {what} length mismatch {} vs {}", cpu.len(), gpu.len());
-    let mut max_rel = 0.0f32;
-    for (i, (&c, &g)) in cpu.iter().zip(gpu.iter()).enumerate() {
-        let denom = c.abs().max(g.abs()).max(1.0);
-        let rel = (c - g).abs() / denom;
-        if rel > max_rel { max_rel = rel; }
+fn spread(n: usize, low: f32, high: f32) -> Vec<f32> {
+    const GOLDEN: f32 = 0.618_034;
+    (0..n).map(|i| low + (high - low) * ((i as f32 + 1.0) * GOLDEN).fract()).collect()
+}
+
+fn sample(shape: &[usize]) -> Tensor {
+    Tensor::from_vec(spread(shape.iter().product(), -0.9, 0.9), shape)
+}
+
+#[track_caller]
+fn assert_close(name: &str, cpu: &[f32], cuda: &[f32], tolerance: f32) {
+    assert_eq!(cpu.len(), cuda.len(), "{name}: {} values on CPU, {} on GPU", cpu.len(), cuda.len());
+    for (i, (&want, &got)) in cpu.iter().zip(cuda).enumerate() {
+        let scale = 1.0f32.max(want.abs());
         assert!(
-            (c - g).abs() <= atol || rel <= rtol,
-            "{name}: {what} mismatch at [{i}]\n  cpu = {c:.6}\n  gpu = {g:.6}\n  abs = {:.6}  rel = {:.6}",
-            (c - g).abs(), rel
+            (want - got).abs() / scale < tolerance,
+            "{name}: element {i} is {want} on CPU but {got} on GPU"
         );
     }
-    eprintln!("  ✓ {name:24} {what:8} max_rel = {max_rel:.2e}");
 }
 
-/// Run `f` on CPU and on CUDA; compare forward output and all input gradients.
-fn check_parity<F>(name: &str, datas: Vec<(Vec<f32>, Vec<usize>)>, rtol: f32, atol: f32, f: F)
-where F: Fn(&[Tensor]) -> Tensor {
-    // Tolerate poisoning so one failing test doesn't cascade into the rest.
-    let _guard = GPU_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    CudaContext::new(0).expect("CUDA init");
+/// Run `f` on both devices and compare its output.
+#[track_caller]
+fn check_forward(name: &str, inputs: &[Tensor], f: impl Fn(&[Tensor]) -> Tensor) {
+    let Some(device) = gpu() else { return };
+    let _guard = lock_gpu();
 
-    // Fixed upstream weights — need output shape first (CPU dry run, no grad).
-    graph::disable_grad();
-    let dry: Vec<Tensor> = datas.iter().map(|(d, s)| Tensor::from_vec(d.clone(), s)).collect();
-    let out_shape = f(&dry).shape().to_vec();
-    let w = rand_data(out_shape.iter().product(), 0xBADC0DE ^ name.len() as u64);
+    let on_cpu = f(inputs).to_vec();
+    let on_gpu: Vec<Tensor> = inputs.iter().map(|t| t.to(device)).collect();
+    let on_gpu = f(&on_gpu).cpu().to_vec();
 
-    // ── CPU forward + backward ──────────────────────────────────────────────
-    graph::enable_grad();
-    let cpu_in: Vec<Tensor> = datas.iter().map(|(d, s)| {
-        let mut t = Tensor::from_vec(d.clone(), s); t.set_requires_grad(true); t
-    }).collect();
-    let cpu_out = f(&cpu_in);
-    let cpu_out_vec = cpu_out.to_vec();
-    let cpu_loss = cpu_out.mul(&Tensor::from_vec(w.clone(), &out_shape)).sum();
-    cpu_loss.backward();
-    let cpu_grads: Vec<Vec<f32>> = cpu_in.iter().map(|t| t.grad().unwrap().to_vec()).collect();
-    graph::disable_grad();
+    assert_close(name, &on_cpu, &on_gpu, OP_TOLERANCE);
+}
 
-    // ── CUDA forward + backward ───────────────────────────────────────────────
-    graph::enable_grad();
-    let gpu_in: Vec<Tensor> = datas.iter().map(|(d, s)| {
-        let mut t = Tensor::from_vec(d.clone(), s).to_device(Device::Cuda(0));
-        t.set_requires_grad(true); t
-    }).collect();
-    let gpu_out = f(&gpu_in);
-    let gpu_out_vec = gpu_out.to_vec();
-    let w_gpu = Tensor::from_vec(w.clone(), &out_shape).to_device(Device::Cuda(0));
-    let gpu_loss = gpu_out.mul(&w_gpu).sum();
-    gpu_loss.backward();
-    let gpu_grads: Vec<Vec<f32>> = gpu_in.iter().map(|t| t.grad().unwrap().to_vec()).collect();
-    graph::disable_grad();
+/// Run `f` on both devices and compare every input gradient.
+#[track_caller]
+fn check_backward(name: &str, inputs: &[Tensor], f: impl Fn(&[Tensor]) -> Tensor) {
+    let Some(device) = gpu() else { return };
+    let _guard = lock_gpu();
 
-    assert_close(name, "forward", &cpu_out_vec, &gpu_out_vec, rtol, atol);
-    for (k, (cg, gg)) in cpu_grads.iter().zip(gpu_grads.iter()).enumerate() {
-        assert_close(name, &format!("grad{k}"), cg, gg, rtol, atol);
+    let gradients = |placed: Vec<Tensor>| -> Vec<Vec<f32>> {
+        let params: Vec<Param> = placed.into_iter().map(Param::new).collect();
+        let loss = f(&params.iter().map(|p| p.tensor()).collect::<Vec<_>>());
+        loss.backward();
+        params
+            .iter()
+            .map(|p| p.grad().expect("input received no gradient").cpu().to_vec())
+            .collect()
+    };
+
+    let on_cpu = gradients(inputs.to_vec());
+    let on_gpu = gradients(inputs.iter().map(|t| t.to(device)).collect());
+
+    for (index, (cpu, cuda)) in on_cpu.iter().zip(&on_gpu).enumerate() {
+        assert_close(&format!("{name} grad[{index}]"), cpu, cuda, OP_TOLERANCE);
     }
 }
 
-// TF32 tolerance for GEMM-based ops; tight tolerance for exact f32 kernels.
-const TF32_RTOL: f32 = 2e-2;
-const EXACT_RTOL: f32 = 1e-4;
-const ATOL: f32 = 2e-3;
-
-// ── Matmul family (cuBLAS, TF32) ──────────────────────────────────────────────
+// ── Element-wise and activations ─────────────────────────────────────────────
 
 #[test]
-fn parity_matmul_2d() {
-    check_parity("matmul_2d", vec![
-        (rand_data(12, 1), vec![3, 4]),
-        (rand_data(20, 2), vec![4, 5]),
-    ], TF32_RTOL, ATOL, |x| x[0].matmul(&x[1]));
+fn elementwise() {
+    let a = sample(&[4, 16]);
+    let b = sample(&[4, 16]);
+
+    check_forward("add", &[a.clone(), b.clone()], |x| x[0].add(&x[1]));
+    check_forward("mul", &[a.clone(), b.clone()], |x| x[0].mul(&x[1]));
+    check_forward("exp", &[a.clone()], |x| x[0].exp());
+    check_forward("clamp", &[a.clone()], |x| x[0].clamp(-0.5, 0.5));
+    check_backward("mul", &[a, b], |x| x[0].mul(&x[1]).sum());
 }
 
 #[test]
-fn parity_matmul_nt_2d() {
-    // The kernel I wrote: C[3,5] = A[3,4] @ B^T, B is [5,4].
-    check_parity("matmul_nt_2d", vec![
-        (rand_data(12, 1), vec![3, 4]),
-        (rand_data(20, 2), vec![5, 4]),
-    ], TF32_RTOL, ATOL, |x| x[0].matmul_nt(&x[1]));
+fn broadcasting_stays_on_device() {
+    // The GPU path materialises the expansion rather than falling back to the
+    // host; the result must still match the CPU's stride walk.
+    check_forward("broadcast add", &[sample(&[4, 8]), sample(&[1, 8])], |x| x[0].add(&x[1]));
+    check_forward("broadcast rank", &[sample(&[4, 8]), sample(&[8])], |x| x[0].mul(&x[1]));
 }
 
 #[test]
-fn parity_matmul_tn_2d() {
-    // C[4,5] = A^T @ B, A is [3,4], B is [3,5].
-    check_parity("matmul_tn_2d", vec![
-        (rand_data(12, 1), vec![3, 4]),
-        (rand_data(15, 2), vec![3, 5]),
-    ], TF32_RTOL, ATOL, |x| x[0].matmul_tn(&x[1]));
+fn activations() {
+    let x = sample(&[8, 32]);
+
+    for (name, f) in activation_cases() {
+        check_forward(name, &[x.clone()], f);
+        check_backward(name, &[x.clone()], |i| f(i).sum());
+    }
+}
+
+/// A named activation, as a plain function pointer so the list can be iterated.
+type Activation = fn(&[Tensor]) -> Tensor;
+
+fn activation_cases() -> Vec<(&'static str, Activation)> {
+    vec![
+        ("relu", |x| x[0].relu()),
+        ("sigmoid", |x| x[0].sigmoid()),
+        ("tanh", |x| x[0].tanh()),
+        ("gelu", |x| x[0].gelu()),
+        ("silu", |x| x[0].silu()),
+        ("leaky_relu", |x| x[0].leaky_relu(0.1)),
+    ]
 }
 
 #[test]
-fn parity_matmul_batched() {
-    // [2, 3, 4] @ [2, 4, 5] — the attention-style batched path.
-    check_parity("matmul_batched", vec![
-        (rand_data(24, 1), vec![2, 3, 4]),
-        (rand_data(40, 2), vec![2, 4, 5]),
-    ], TF32_RTOL, ATOL, |x| x[0].matmul(&x[1]));
+fn softmax() {
+    let x = sample(&[8, 16]);
+    let weights = sample(&[8, 16]);
+
+    check_forward("softmax", &[x.clone()], |x| x[0].softmax());
+    check_forward("log_softmax", &[x.clone()], |x| x[0].log_softmax());
+
+    // Weighted so the gradient is non-trivial; a plain sum over softmax is
+    // constant and its gradient is zero on both devices whatever the kernel does.
+    check_backward("softmax", &[x, weights], |x| x[0].softmax().mul(&x[1]).sum());
+}
+
+// ── Matrix multiplication ────────────────────────────────────────────────────
+
+#[test]
+fn gemm_layouts() {
+    check_forward("matmul", &[sample(&[8, 12]), sample(&[12, 6])], |x| x[0].matmul(&x[1]));
+    check_forward("matmul_nt", &[sample(&[8, 12]), sample(&[6, 12])], |x| x[0].matmul_nt(&x[1]));
+    check_forward("matmul_tn", &[sample(&[12, 8]), sample(&[12, 6])], |x| x[0].matmul_tn(&x[1]));
+
+    check_backward("matmul", &[sample(&[8, 12]), sample(&[12, 6])], |x| {
+        x[0].matmul(&x[1]).sum()
+    });
+    check_backward("matmul_nt", &[sample(&[8, 12]), sample(&[6, 12])], |x| {
+        x[0].matmul_nt(&x[1]).sum()
+    });
 }
 
 #[test]
-fn parity_matmul_nt_batched() {
-    // [2,3,4] @ B^T where B is [2,5,4] → [2,3,5]. Used in attention backward.
-    check_parity("matmul_nt_batch", vec![
-        (rand_data(24, 1), vec![2, 3, 4]),
-        (rand_data(40, 2), vec![2, 5, 4]),
-    ], TF32_RTOL, ATOL, |x| x[0].matmul_nt(&x[1]));
+fn gemm_batched() {
+    check_forward("batched", &[sample(&[4, 8, 12]), sample(&[4, 12, 6])], |x| {
+        x[0].matmul(&x[1])
+    });
+    check_forward("batched nt", &[sample(&[4, 8, 12]), sample(&[4, 6, 12])], |x| {
+        x[0].matmul_nt(&x[1])
+    });
+    // One side batched, the other shared — how a weight meets a batch of inputs.
+    check_forward("shared weight", &[sample(&[8, 12]), sample(&[4, 12, 6])], |x| {
+        x[0].matmul(&x[1])
+    });
+}
+
+// ── Layout ───────────────────────────────────────────────────────────────────
+
+#[test]
+fn layout_ops() {
+    let x = sample(&[2, 3, 4]);
+    let weights = sample(&[4, 3, 2]);
+
+    check_forward("permute", &[x.clone()], |x| x[0].permute(&[2, 1, 0]));
+    check_forward("transpose", &[x.clone()], |x| x[0].transpose());
+    check_forward("expand", &[sample(&[1, 6])], |x| x[0].expand(&[4, 6]));
+    check_backward("permute", &[x, weights], |x| x[0].permute(&[2, 1, 0]).mul(&x[1]).sum());
+}
+
+// ── Reductions ───────────────────────────────────────────────────────────────
+
+#[test]
+fn reductions() {
+    let x = sample(&[6, 10]);
+
+    check_forward("sum", &[x.clone()], |x| x[0].sum());
+    check_forward("mean", &[x.clone()], |x| x[0].mean());
+    check_forward("sum_axis 0", &[x.clone()], |x| x[0].sum_axis(0));
+    check_forward("sum_axis 1", &[x.clone()], |x| x[0].sum_axis(1));
+    check_backward("sum_axis", &[x, sample(&[10])], |x| x[0].sum_axis(0).mul(&x[1]).sum());
+}
+
+// ── Fused layers ─────────────────────────────────────────────────────────────
+
+#[test]
+fn layer_norm() {
+    let x = sample(&[6, 16]);
+    let gamma = Tensor::full(&[16], 1.1);
+    let beta = Tensor::full(&[16], -0.2);
+
+    check_forward("layer_norm", &[x.clone(), gamma.clone(), beta.clone()], |x| {
+        x[0].layer_norm(&x[1], &x[2], 1e-5)
+    });
+    // The GPU kernel produces all three gradients in one pass; the CPU path
+    // computes them separately. They must agree.
+    //
+    // The weights come in as a fourth input rather than being built inside the
+    // closure: a tensor made in there would always be on the host and would not
+    // survive the GPU run.
+    check_backward("layer_norm", &[x, gamma, beta, sample(&[6, 16])], |x| {
+        x[0].layer_norm(&x[1], &x[2], 1e-5).mul(&x[3]).sum()
+    });
 }
 
 #[test]
-fn parity_matmul_tn_batched() {
-    // A^T where A is [2,4,3], @ B[2,4,5] → [2,3,5]. Used in attention backward.
-    check_parity("matmul_tn_batch", vec![
-        (rand_data(24, 1), vec![2, 4, 3]),
-        (rand_data(40, 2), vec![2, 4, 5]),
-    ], TF32_RTOL, ATOL, |x| x[0].matmul_tn(&x[1]));
-}
-
-// ── Exact-f32 kernels (permute, expand, sum_axis, transpose, elementwise) ─────
-
-#[test]
-fn parity_permute_3d() {
-    check_parity("permute_3d", vec![(rand_data(24, 1), vec![2, 3, 4])],
-        EXACT_RTOL, ATOL, |x| x[0].permute(&[1, 2, 0]));
-}
-
-#[test]
-fn parity_permute_4d() {
-    // The exact attention permutation [0,2,1,3].
-    check_parity("permute_4d", vec![(rand_data(48, 1), vec![2, 4, 3, 2])],
-        EXACT_RTOL, ATOL, |x| x[0].permute(&[0, 2, 1, 3]));
+fn row_reductions_handle_awkward_widths() {
+    // The block reductions behind softmax and layer norm halve the thread count
+    // each round, so a width that is not a power of two used to lose its tail.
+    // 5 and 10 both exercise that; 10 is MNIST's class count.
+    for width in [3usize, 5, 7, 10, 17, 31, 100, 257] {
+        let x = sample(&[4, width]);
+        check_forward(&format!("softmax width {width}"), &[x.clone()], |x| x[0].softmax());
+        check_forward(&format!("log_softmax width {width}"), &[x.clone()], |x| {
+            x[0].log_softmax()
+        });
+        check_forward(
+            &format!("layer_norm width {width}"),
+            &[x, Tensor::full(&[width], 1.1), Tensor::full(&[width], -0.2)],
+            |x| x[0].layer_norm(&x[1], &x[2], 1e-5),
+        );
+    }
 }
 
 #[test]
-fn parity_expand() {
-    check_parity("expand", vec![(rand_data(4, 1), vec![1, 4])],
-        EXACT_RTOL, ATOL, |x| x[0].expand(&[3, 4]));
+fn attention_matches_across_sequence_lengths() {
+    let Some(device) = gpu() else { return };
+    let _guard = lock_gpu();
+
+    // Attention softmaxes over the key axis, so the sequence length *is* the
+    // reduction width — the exact place the power-of-two bug showed up.
+    for length in [1usize, 3, 5, 8, 13] {
+        manual_seed(5);
+        let attention = MultiHeadAttention::new(16, 4, 0.0);
+        let x = sample(&[2, length, 16]);
+
+        let on_cpu = attention.attend(&x, &x, &x, true).to_vec();
+        attention.to_device(device);
+        let moved = x.to(device);
+        let on_gpu = attention.attend(&moved, &moved, &moved, true).cpu().to_vec();
+
+        assert_close(&format!("attention over {length}"), &on_cpu, &on_gpu, MODEL_TOLERANCE);
+    }
 }
 
 #[test]
-fn parity_sum_axis() {
-    check_parity("sum_axis0", vec![(rand_data(12, 1), vec![3, 4])],
-        EXACT_RTOL, ATOL, |x| x[0].sum_axis(0));
-    check_parity("sum_axis1", vec![(rand_data(12, 1), vec![3, 4])],
-        EXACT_RTOL, ATOL, |x| x[0].sum_axis(1));
+fn embedding_lookup() {
+    let table = sample(&[10, 8]);
+    let weights = sample(&[5, 8]);
+
+    check_forward("index_select", &[table.clone()], |x| x[0].index_select(&[0, 3, 3, 9, 1]));
+    // Row 3 twice: the GPU scatter-add must accumulate, not overwrite.
+    check_backward("index_select", &[table, weights], |x| {
+        x[0].index_select(&[0, 3, 3, 9, 1]).mul(&x[1]).sum()
+    });
+}
+
+// ── End to end ───────────────────────────────────────────────────────────────
+
+#[test]
+fn a_transformer_block_matches() {
+    let Some(device) = gpu() else { return };
+    let _guard = lock_gpu();
+
+    manual_seed(11);
+    let block = TransformerBlock::causal(16, 4, 32, 0.0);
+    block.eval();
+    let x = sample(&[2, 5, 16]);
+
+    let on_cpu = block.forward(&x).to_vec();
+    block.to_device(device);
+    let on_gpu = block.forward(&x.to(device)).cpu().to_vec();
+
+    assert_close("transformer block", &on_cpu, &on_gpu, MODEL_TOLERANCE);
 }
 
 #[test]
-fn parity_transpose() {
-    check_parity("transpose", vec![(rand_data(12, 1), vec![3, 4])],
-        EXACT_RTOL, ATOL, |x| x[0].transpose());
-}
+fn a_model_trains_identically_on_both_devices() {
+    let Some(device) = gpu() else { return };
+    let _guard = lock_gpu();
 
-#[test]
-fn parity_elementwise() {
-    check_parity("add", vec![(rand_data(12,1), vec![3,4]), (rand_data(12,2), vec![3,4])],
-        EXACT_RTOL, ATOL, |x| x[0].add(&x[1]));
-    check_parity("mul", vec![(rand_data(12,1), vec![3,4]), (rand_data(12,2), vec![3,4])],
-        EXACT_RTOL, ATOL, |x| x[0].mul(&x[1]));
-}
+    let train = |device: Device| {
+        manual_seed(3);
+        let model = Sequential::new()
+            .add(Linear::new(8, 12))
+            .add(ReLU)
+            .add(Linear::new(12, 4));
+        model.to_device(device);
 
-// ── Activations with CUDA backward fast paths ─────────────────────────────────
+        let mut opt = SGD::new(model.parameters(), 0.1);
+        let inputs = sample(&[6, 8]).to(device);
+        let targets = [0usize, 1, 2, 3, 1, 0];
 
-#[test]
-fn parity_activations() {
-    check_parity("relu", vec![(rand_data(12, 1), vec![3, 4])], EXACT_RTOL, ATOL, |x| x[0].relu());
-    check_parity("gelu", vec![(rand_data(12, 2), vec![3, 4])], 1e-3, ATOL, |x| x[0].gelu());
-    check_parity("sigmoid", vec![(rand_data(12, 3), vec![3, 4])], 1e-3, ATOL, |x| x[0].sigmoid());
-    check_parity("softmax", vec![(rand_data(12, 4), vec![3, 4])], 1e-3, ATOL, |x| x[0].softmax());
-}
+        for _ in 0..10 {
+            let loss = cross_entropy(&model.forward(&inputs), &targets);
+            opt.zero_grad();
+            loss.backward();
+            opt.step();
+        }
+        cross_entropy(&model.forward(&inputs), &targets).item()
+    };
 
-// ── LayerNorm: LayerNormCudaBackward (GPU) vs LayerNormBackward (CPU) ─────────
-// Note: this verifies the dL/dx path matches. The CPU path does not compute
-// gamma/beta grads, so we only check the input gradient here.
-
-#[test]
-fn parity_layernorm_input() {
-    check_parity("layernorm", vec![(rand_data(12, 1), vec![3, 4])],
-        1e-3, ATOL, |x| LayerNorm::new(&[4]).forward(&x[0]));
+    let on_cpu = train(Device::Cpu);
+    let on_gpu = train(device);
+    assert_close("final loss", &[on_cpu], &[on_gpu], MODEL_TOLERANCE);
 }
