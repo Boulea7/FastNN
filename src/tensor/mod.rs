@@ -14,6 +14,7 @@
 //! assert_eq!(y.item(), 54.0);  // [[7, 10], [15, 22]] summed
 //! ```
 
+mod checked;
 mod core;
 mod device;
 mod display;

@@ -20,6 +20,11 @@ pub enum Error {
     Checkpoint(String),
     /// A dataset could not be downloaded or parsed.
     Dataset(String),
+    /// Shapes or devices did not line up.
+    ///
+    /// Only the [`try_*`](crate::tensor::Tensor::try_matmul) ops produce this.
+    /// The ordinary ops panic instead — see the module docs.
+    Shape(String),
 }
 
 /// Shorthand for results carrying a fastnn [`Error`].
@@ -33,6 +38,7 @@ impl fmt::Display for Error {
             Error::Io(e) => write!(f, "io: {e}"),
             Error::Checkpoint(msg) => write!(f, "checkpoint: {msg}"),
             Error::Dataset(msg) => write!(f, "dataset: {msg}"),
+            Error::Shape(msg) => write!(f, "shape: {msg}"),
         }
     }
 }
