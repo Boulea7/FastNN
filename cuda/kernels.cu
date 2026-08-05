@@ -164,6 +164,19 @@ __global__ void kernel_clamp(const float* a, float min_val, float max_val, float
     if (idx < n) out[idx] = fminf(fmaxf(a[idx], min_val), max_val);
 }
 
+// Threads for a one-block-per-row reduction over `n` values.
+//
+// The tree reductions below halve blockDim.x each round, so a thread count that
+// is not a power of two silently drops the tail: with 5 threads, stride 2 folds
+// 2->0 and 3->1 and thread 4 is never read. Round up instead. Threads past `n`
+// skip their strided loop entirely and so contribute the identity (0 for a sum,
+// -FLT_MAX for a max), which is exactly what the reduction needs.
+__host__ inline int reduction_threads(int n) {
+    int threads = 1;
+    while (threads < n && threads < BLOCK_SIZE) threads <<= 1;
+    return threads;
+}
+
 #define LAUNCH_ELEMENTWISE(kernel, ...) \
     do { \
         int blocks = div_ceil((int)n, BLOCK_SIZE); \
@@ -405,21 +418,21 @@ __global__ void kernel_log_softmax(const float* input, float* output, int batch_
 }
 
 extern "C" int fastnn_cuda_softmax(const float* input, float* output, int bs, int nc) {
-    int threads = min(nc, BLOCK_SIZE);
+    int threads = reduction_threads(nc);
     kernel_softmax<<<bs, threads, threads * sizeof(float)>>>(input, output, bs, nc);
     CUDA_CHECK(cudaGetLastError());
     return 0;
 }
 
 extern "C" int fastnn_cuda_softmax_backward(const float* go, const float* out, float* gi, int bs, int nc) {
-    int threads = min(nc, BLOCK_SIZE);
+    int threads = reduction_threads(nc);
     kernel_softmax_backward<<<bs, threads, threads * sizeof(float)>>>(go, out, gi, bs, nc);
     CUDA_CHECK(cudaGetLastError());
     return 0;
 }
 
 extern "C" int fastnn_cuda_log_softmax(const float* input, float* output, int bs, int nc) {
-    int threads = min(nc, BLOCK_SIZE);
+    int threads = reduction_threads(nc);
     kernel_log_softmax<<<bs, threads, threads * sizeof(float)>>>(input, output, bs, nc);
     CUDA_CHECK(cudaGetLastError());
     return 0;
@@ -1446,7 +1459,7 @@ extern "C" int fastnn_cuda_layer_norm_forward(
     float* output, float* mean, float* inv_var,
     int batch_size, int normalized_size, float epsilon)
 {
-    int threads = min(normalized_size, BLOCK_SIZE);
+    int threads = reduction_threads(normalized_size);
     kernel_layer_norm_forward<<<batch_size, threads, threads * sizeof(float)>>>(
         input, gamma, beta, output, mean, inv_var, batch_size, normalized_size, epsilon);
     CUDA_CHECK(cudaGetLastError());
@@ -1510,7 +1523,7 @@ extern "C" int fastnn_cuda_layer_norm_backward(
 {
     CUDA_CHECK(cudaMemset(grad_gamma, 0, normalized_size * sizeof(float)));
     CUDA_CHECK(cudaMemset(grad_beta, 0, normalized_size * sizeof(float)));
-    int threads = min(normalized_size, BLOCK_SIZE);
+    int threads = reduction_threads(normalized_size);
     kernel_layer_norm_backward<<<batch_size, threads, 2 * threads * sizeof(float)>>>(
         grad_output, input, gamma, mean, inv_var,
         grad_input, grad_gamma, grad_beta, batch_size, normalized_size);
@@ -1553,7 +1566,7 @@ extern "C" int fastnn_cuda_rms_norm_forward(
     float* output, float* rms,
     int batch_size, int normalized_size, float epsilon)
 {
-    int threads = min(normalized_size, BLOCK_SIZE);
+    int threads = reduction_threads(normalized_size);
     kernel_rms_norm_forward<<<batch_size, threads, threads * sizeof(float)>>>(
         input, gamma, output, rms, batch_size, normalized_size, epsilon);
     CUDA_CHECK(cudaGetLastError());
