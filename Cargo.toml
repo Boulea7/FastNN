@@ -1,8 +1,8 @@
 [package]
 name = "fastnn"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
-description = "A GPU-accelerated deep learning library built from scratch with Rust and CUDA"
+description = "A deep learning library in Rust, with CUDA kernels for the parts that matter"
 license = "MIT"
 readme = "README.md"
 keywords = ["deep-learning", "neural-network", "cuda", "gpu", "machine-learning"]
@@ -13,44 +13,32 @@ name = "fastnn"
 path = "src/lib.rs"
 
 [dependencies]
-rand = "0.8"
-rand_distr = "0.4"
-rayon = "1.8"
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-bincode = "1.3"
-log = "0.4"
-env_logger = "0.10"
-thiserror = "1.0"
-num-traits = "0.2"
-bytemuck = { version = "1.14", features = ["derive"] }
-libm = "0.2.16"
-ureq = "2.9"
-flate2 = "1.0"
+rand = "0.8"        # weight init, dropout masks, shuffling
+rand_distr = "0.4"  # normal distribution
+rayon = "1.8"       # data parallelism on the CPU paths
+libm = "0.2"        # erff, for exact GELU
+ureq = "2.9"        # dataset download
+flate2 = "1.0"      # dataset decompression
 
 [build-dependencies]
 cc = { version = "1.0", features = ["parallel"] }
-glob = "0.3"
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
-approx = "0.5"
 
-[[example]]
-name = "mnist"
-path = "examples/mnist.rs"
-
-[[example]]
-name = "mnist_mlp"
-path = "examples/mnist_mlp.rs"
-
-[[example]]
-name = "transformer"
-path = "examples/transformer.rs"
+[features]
+default = ["cuda"]
+# Compile cuda/kernels.cu with nvcc and link cudart/cublas/curand.
+# Without it, cuda/stubs.c supplies the symbols and everything runs on the CPU.
+cuda = []
 
 [[example]]
 name = "simple_mlp"
 path = "examples/simple_mlp.rs"
+
+[[example]]
+name = "mnist_mlp"
+path = "examples/mnist_mlp.rs"
 
 [[example]]
 name = "mnist_cnn"
@@ -64,11 +52,6 @@ path = "examples/char_lm.rs"
 name = "tensor_ops"
 harness = false
 path = "benches/tensor_ops.rs"
-
-[features]
-default = ["cuda"]
-cuda = []
-f16 = []
 
 [profile.release]
 opt-level = 3
