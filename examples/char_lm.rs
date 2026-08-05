@@ -9,9 +9,15 @@
 //!
 //!     curl -o shakespeare.txt \
 //!       https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt
+//!
+//! It checkpoints as it goes and resumes from `char_lm.fdl` if one is there, so
+//! stopping it with Ctrl-C costs at most a few hundred steps.
 
 use fastnn::nn::module::scoped;
 use fastnn::prelude::*;
+
+/// Where an interrupted run is saved so it can be picked up again.
+const CHECKPOINT: &str = "char_lm.fdl";
 
 const CORPUS: &str = include_str!("data/tiny_corpus.txt");
 
@@ -35,13 +41,21 @@ fn main() -> fastnn::Result<()> {
     println!("model:  {} parameters on {device}\n", model.num_parameters());
 
     let mut opt = AdamW::new(model.parameters(), config.lr).betas(0.9, 0.95);
+
+    // Resume if a previous run left a checkpoint, otherwise start from scratch.
+    // Weights alone would not be enough: AdamW's moments and step count decide
+    // how large the next update is.
+    let first_step = load_training(&model, &mut opt, CHECKPOINT).unwrap_or(0) as usize;
+    if first_step > 0 {
+        println!("resuming from step {first_step}\n");
+    }
     // Warmup first: Adam's variance estimate is unreliable for the first few
     // hundred steps, and a full-size update built on it can wreck the model.
     let schedule = Warmup::new(CosineAnnealing::new(config.lr, config.steps), config.warmup);
     let params = model.parameters();
 
     model.train();
-    for step in 0..config.steps {
+    for step in first_step..config.steps {
         opt.set_lr(schedule.lr_at(step));
 
         let (inputs, targets) = sample_batch(&data, &config);
@@ -59,6 +73,9 @@ fn main() -> fastnn::Result<()> {
                 "step {:5}/{}  loss {:.4}  lr {:.2e}",
                 step + 1, config.steps, loss.item(), opt.lr()
             );
+        }
+        if (step + 1) % config.checkpoint_every == 0 {
+            save_training(&model, &opt, step as u64 + 1, CHECKPOINT)?;
         }
     }
 
@@ -224,6 +241,7 @@ struct Config {
     warmup: usize,
     steps: usize,
     report_every: usize,
+    checkpoint_every: usize,
 }
 
 impl Config {
@@ -232,13 +250,13 @@ impl Config {
         // so capacity scales with the amount of text available.
         if chars > 200_000 {
             Config { context: 128, batch: 32, width: 256, heads: 8, layers: 6,
-                     lr: 3e-4, warmup: 400, steps: 5_000, report_every: 100 }
+                     lr: 3e-4, warmup: 400, steps: 5_000, report_every: 100, checkpoint_every: 500 }
         } else if chars > 20_000 {
             Config { context: 64, batch: 32, width: 128, heads: 4, layers: 4,
-                     lr: 3e-4, warmup: 200, steps: 3_000, report_every: 100 }
+                     lr: 3e-4, warmup: 200, steps: 3_000, report_every: 100, checkpoint_every: 500 }
         } else {
             Config { context: 32, batch: 16, width: 64, heads: 4, layers: 2,
-                     lr: 1e-3, warmup: 100, steps: 1_500, report_every: 100 }
+                     lr: 1e-3, warmup: 100, steps: 1_500, report_every: 100, checkpoint_every: 500 }
         }
     }
 }
