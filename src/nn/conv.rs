@@ -1,191 +1,86 @@
-use std::collections::HashMap;
-use std::sync::Arc;
-use crate::tensor::Tensor;
-use crate::nn::module::Module;
-use crate::autograd::graph;
-use crate::autograd::backward_ops::Conv2dBackward;
+//! 2-D convolution.
 
-/// 2D Convolution layer.
+use crate::tensor::{Tensor, Window};
+
+use super::module::Module;
+use super::param::Param;
+
+/// Convolution over `[N, C, H, W]`, implemented as unfold-then-multiply.
+///
+/// [`im2col`](Tensor::im2col) lays every sliding window out as a column, which
+/// turns the convolution into one matrix multiply against a `[out_channels,
+/// C·kh·kw]` weight. That is why this layer needs no gradient code of its own:
+/// the derivatives of `im2col` and `matmul` already compose into the right thing.
 pub struct Conv2d {
-    pub weight: Tensor, // [out_channels, in_channels, kernel_h, kernel_w]
-    pub bias: Option<Tensor>,
+    pub weight: Param,
+    pub bias: Option<Param>,
+    window: Window,
     in_channels: usize,
     out_channels: usize,
-    kernel_size: (usize, usize),
-    stride: (usize, usize),
-    padding: (usize, usize),
 }
 
 impl Conv2d {
-    pub fn new(
-        in_channels: usize,
-        out_channels: usize,
-        kernel_size: usize,
-        stride: usize,
-        padding: usize,
-    ) -> Self {
-        Self::with_params(in_channels, out_channels, (kernel_size, kernel_size), (stride, stride), (padding, padding), true)
+    /// A square kernel with the given stride and padding.
+    pub fn new(in_channels: usize, out_channels: usize, kernel: usize, stride: usize, padding: usize) -> Conv2d {
+        Conv2d::with_window(in_channels, out_channels, Window::square(kernel, stride, padding), true)
     }
 
-    pub fn with_params(
-        in_channels: usize,
-        out_channels: usize,
-        kernel_size: (usize, usize),
-        stride: (usize, usize),
-        padding: (usize, usize),
-        use_bias: bool,
-    ) -> Self {
-        let fan_in = in_channels * kernel_size.0 * kernel_size.1;
-        let mut weight = Tensor::kaiming_uniform(
-            &[out_channels, in_channels, kernel_size.0, kernel_size.1],
-            fan_in,
-        );
-        weight.set_requires_grad(true);
+    /// `kernel × kernel`, stride 1, padded to preserve the spatial size.
+    pub fn same(in_channels: usize, out_channels: usize, kernel: usize) -> Conv2d {
+        assert!(kernel % 2 == 1, "same-padding needs an odd kernel, got {kernel}");
+        Conv2d::new(in_channels, out_channels, kernel, 1, kernel / 2)
+    }
 
-        let bias = if use_bias {
-            let bound = 1.0 / (fan_in as f32).sqrt();
-            let mut b = Tensor::from_vec(
-                (0..out_channels).map(|_| {
-                    use rand::Rng;
-                    rand::thread_rng().gen_range(-bound..bound)
-                }).collect(),
-                &[out_channels],
-            );
-            b.set_requires_grad(true);
-            Some(b)
-        } else {
-            None
-        };
-
+    /// Full control over the window and whether there is a bias.
+    pub fn with_window(in_channels: usize, out_channels: usize, window: Window, bias: bool) -> Conv2d {
+        let (kh, kw) = window.kernel;
+        let fan_in = in_channels * kh * kw;
         Conv2d {
-            weight,
-            bias,
+            weight: Param::new(Tensor::kaiming_uniform(&[out_channels, in_channels, kh, kw], fan_in)),
+            bias: bias.then(|| {
+                let bound = 1.0 / (fan_in as f32).sqrt();
+                Param::new(Tensor::uniform(&[out_channels], -bound, bound))
+            }),
+            window,
             in_channels,
             out_channels,
-            kernel_size,
-            stride,
-            padding,
         }
     }
 
-    /// Output spatial dimensions for a given input size.
-    pub fn output_size(&self, input_h: usize, input_w: usize) -> (usize, usize) {
-        let out_h = (input_h + 2 * self.padding.0 - self.kernel_size.0) / self.stride.0 + 1;
-        let out_w = (input_w + 2 * self.padding.1 - self.kernel_size.1) / self.stride.1 + 1;
-        (out_h, out_w)
+    /// Output spatial size for an input of `(height, width)`.
+    pub fn output_size(&self, height: usize, width: usize) -> (usize, usize) {
+        self.window.output_size(height, width)
     }
 }
 
 impl Module for Conv2d {
     fn forward(&self, input: &Tensor) -> Tensor {
-        // input: [batch, in_channels, H, W]
-        let shape = input.shape();
-        assert_eq!(shape.len(), 4, "Conv2d expects 4D input [N, C, H, W]");
-        let (batch_size, in_c, in_h, in_w) = (shape[0], shape[1], shape[2], shape[3]);
-        assert_eq!(in_c, self.in_channels);
+        assert_eq!(input.ndim(), 4, "Conv2d expects [N, C, H, W], got {:?}", input.shape());
+        assert_eq!(
+            input.dim(1), self.in_channels,
+            "Conv2d expects {} channels, got {:?}", self.in_channels, input.shape()
+        );
 
-        let (out_h, out_w) = self.output_size(in_h, in_w);
-        let input_data = input.to_vec();
-        let weight_data = self.weight.to_vec();
+        let (batch, height, width) = (input.dim(0), input.dim(2), input.dim(3));
+        let (out_h, out_w) = self.window.output_size(height, width);
+        let out_c = self.out_channels as i64;
 
-        let (kh, kw) = self.kernel_size;
-        let (sh, sw) = self.stride;
-        let (ph, pw) = self.padding;
+        // [N, C·kh·kw, out_h·out_w] against [out_channels, C·kh·kw].
+        let columns = input.im2col(self.window);
+        let kernels = self.weight.tensor().reshape(&[out_c, -1]);
+        let mut out = kernels.matmul(&columns);
 
-        let mut output = vec![0.0f32; batch_size * self.out_channels * out_h * out_w];
-
-        for b in 0..batch_size {
-            for oc in 0..self.out_channels {
-                for oh in 0..out_h {
-                    for ow in 0..out_w {
-                        let mut sum = if let Some(ref bias) = self.bias {
-                            bias.data()[oc]
-                        } else {
-                            0.0f32
-                        };
-                        for ic in 0..self.in_channels {
-                            for ki in 0..kh {
-                                for kj in 0..kw {
-                                    let ih = (oh * sh + ki) as isize - ph as isize;
-                                    let iw = (ow * sw + kj) as isize - pw as isize;
-                                    if ih >= 0 && ih < in_h as isize && iw >= 0 && iw < in_w as isize {
-                                        let input_idx = ((b * in_c + ic) * in_h + ih as usize) * in_w + iw as usize;
-                                        let weight_idx = ((oc * self.in_channels + ic) * kh + ki) * kw + kj;
-                                        sum += input_data[input_idx] * weight_data[weight_idx];
-                                    }
-                                }
-                            }
-                        }
-                        output[((b * self.out_channels + oc) * out_h + oh) * out_w + ow] = sum;
-                    }
-                }
-            }
+        if let Some(bias) = &self.bias {
+            out = out.add(&bias.tensor().reshape(&[1, out_c, 1]));
         }
 
-        let mut out = Tensor::from_vec(output, &[batch_size, self.out_channels, out_h, out_w]);
-
-        let any_requires_grad = input.requires_grad()
-            || self.weight.requires_grad()
-            || self.bias.as_ref().map_or(false, |b| b.requires_grad());
-
-        if graph::is_grad_enabled() && any_requires_grad {
-            out.set_requires_grad(true);
-
-            // input_ids and leaf cells: always [input, weight, bias?]
-            let has_bias = self.bias.is_some();
-            let mut input_ids = vec![input.id(), self.weight.id()];
-            let mut leaf_cells = Vec::new();
-            if input.requires_grad() {
-                leaf_cells.push((input.id(), input.grad_cell()));
-            }
-            if self.weight.requires_grad() {
-                leaf_cells.push((self.weight.id(), self.weight.grad_cell()));
-            }
-            if let Some(ref bias) = self.bias {
-                input_ids.push(bias.id());
-                if bias.requires_grad() {
-                    leaf_cells.push((bias.id(), bias.grad_cell()));
-                }
-            }
-
-            let grad_fn = Arc::new(Conv2dBackward {
-                input_ids,
-                input: input.clone(),
-                weight: self.weight.clone(),
-                has_bias,
-                out_channels: self.out_channels,
-                kernel_size: self.kernel_size,
-                stride: self.stride,
-                padding: self.padding,
-            });
-
-            graph::record_op_with_cells(grad_fn, out.id(), leaf_cells);
-        }
-
-        out
+        out.reshape(&[batch as i64, out_c, out_h as i64, out_w as i64])
     }
 
-    fn parameters(&self) -> Vec<Tensor> {
-        let mut params = vec![self.weight.clone()];
-        if let Some(ref bias) = self.bias {
-            params.push(bias.clone());
-        }
-        params
-    }
-
-    fn parameters_mut(&mut self) -> Vec<&mut Tensor> {
-        let mut params = vec![&mut self.weight];
-        if let Some(ref mut bias) = self.bias {
-            params.push(bias);
-        }
-        params
-    }
-
-    fn named_parameters(&self) -> HashMap<String, Tensor> {
-        let mut params = HashMap::new();
-        params.insert("weight".to_string(), self.weight.clone());
-        if let Some(ref bias) = self.bias {
-            params.insert("bias".to_string(), bias.clone());
+    fn named_parameters(&self) -> Vec<(String, Param)> {
+        let mut params = vec![("weight".into(), self.weight.clone())];
+        if let Some(bias) = &self.bias {
+            params.push(("bias".into(), bias.clone()));
         }
         params
     }
