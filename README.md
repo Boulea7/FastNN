@@ -101,14 +101,75 @@ the optimizer hold handles to the same weight and the same gradient, which is wh
 without special support: use the same handle twice and both paths' gradients add
 up on their own.
 
+## Running unattended
+
+Four things a long run needs, none of which the training loop above shows.
+
+**Resume where you stopped.** `save()` writes weights, which is what you want for
+a finished model. Resuming needs the optimizer too — its momentum, Adam's two
+moment estimates, and the step count that drives bias correction. Restore weights
+alone and the optimizer restarts at step 1, so the first update after resuming
+lands far harder than it should.
+
+```rust
+let mut step = load_training(&model, &mut opt, "run.fdl").unwrap_or(0);
+
+while step < total {
+    // ... train ...
+    step += 1;
+    if step % 500 == 0 { save_training(&model, &opt, step, "run.fdl")?; }
+}
+```
+
+Loading a plain checkpoint with `load_training` is an error rather than a silent
+optimizer reset. `char_lm` does this, so Ctrl-C costs at most a few hundred steps.
+
+**Find the NaN at the op that made it.** One non-finite gradient becomes a
+non-finite weight, and every activation downstream is NaN from then on — the loss
+only *prints* as NaN some steps later, by which point the checkpoint is poisoned
+too and the culprit is long gone.
+
+```rust
+detect_anomaly(|| {
+    loss.backward();     // panics: "anomaly: Log produced inf in the gradient for input 0"
+});
+
+if !opt.gradients_are_finite() { continue; }   // cheap guard: skip the batch
+```
+
+Both read every gradient, so they are debugging and guard-rail tools, not
+something to leave on in a healthy loop.
+
+**Freeze a backbone.** Frozen parameters hand out a detached tensor, so the
+backward pass stops there — no gradient is computed only to be discarded.
+
+```rust
+backbone.freeze();
+let mut opt = Adam::new(model.parameters(), 1e-3);   // updates only the head
+```
+
+**Report a bad shape instead of dying.** Ordinary ops panic, which is right
+inside a model. At the edge of an app — a shape from a config file, a batch from
+an upload — use the `try_` variants.
+
+```rust
+let y = x.try_matmul(&w)?;      // Error::Shape, not a panic
+x.try_reshape(&[2, -1])?;
+table.try_index_select(&ids)?;
+```
+
+They validate and then delegate, so there is still exactly one implementation of
+each operation, and they build the same graph.
+
 ## Layout
 
-Every file is one idea, and none are long. 67 files, ~7,000 lines.
+Every file is one idea, and none are long. 71 files, ~8.0k lines.
 
 ```
 src/
   tensor/          the array type and everything you can do to it
     core.rs          Tensor: shape, storage, graph link
+    checked.rs       try_* variants that report instead of panicking
     shape.rs         strides, broadcasting, index math
     storage.rs       the bytes, on one device or the other
     device.rs        Device::cuda(0) -> Result
@@ -121,6 +182,7 @@ src/
     node.rs          Backward trait, graph nodes, gradient slots
     engine.rs        the reverse pass
     mode.rs          no_grad
+    anomaly.rs       detect_anomaly
     ops/             one backward rule per forward op, same file names
 
   nn/              layers, all implementing Module
@@ -128,9 +190,9 @@ src/
     norm.rs activation.rs dropout.rs shape.rs embedding.rs
     attention.rs transformer.rs rnn.rs loss.rs
 
-  optim/           sgd.rs  adam.rs  schedule.rs
+  optim/           sgd.rs  adam.rs  schedule.rs  state.rs
   data/            dataset.rs  loader.rs  mnist.rs
-  serialize/       checkpoint.rs
+  serialize/       checkpoint.rs (weights)  training.rs (weights + optimizer)
   cuda/            ffi.rs (raw bindings)  kernels.rs (safe wrappers)  buffer.rs
   rng.rs  error.rs  lib.rs
 
@@ -204,6 +266,7 @@ load(&model, "model.fdl")?;          // missing file, or a shape that moved
 
 ```bash
 cargo test --no-default-features --test gradcheck   # every backward rule
+cargo test --no-default-features --test robustness  # resume, anomalies, freezing
 cargo test --test cuda_parity -- --test-threads=1   # CPU vs GPU
 cargo test --no-default-features                    # everything
 cargo bench --no-default-features                   # throughput

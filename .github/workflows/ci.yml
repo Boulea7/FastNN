@@ -34,6 +34,9 @@ jobs:
       - name: Gradient checks (finite difference)
         run: cargo test --no-default-features --test gradcheck -- --nocapture
 
+      - name: Robustness (resume, anomalies, freezing)
+        run: cargo test --no-default-features --test robustness
+
       - name: Unit + integration tests
         run: cargo test --no-default-features
 
