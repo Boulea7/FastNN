@@ -6,9 +6,9 @@ on:
   pull_request:
 
 jobs:
-  # CPU-only build + the full finite-difference gradient-check suite.
-  # No CUDA toolkit on GitHub runners, so this exercises the CPU autograd math
-  # (which the CUDA kernels are validated against locally via cuda_parity).
+  # CPU-only build plus the full finite-difference gradient-check suite.
+  # GitHub runners have no CUDA toolkit, so this exercises the CPU maths; the
+  # kernels are checked against it locally by tests/cuda_parity.rs.
   cpu:
     runs-on: ubuntu-latest
     steps:
@@ -39,4 +39,3 @@ jobs:
 
       - name: Clippy
         run: cargo clippy --no-default-features --all-targets -- -D warnings
-        continue-on-error: true   # warnings tracked, not yet gating

@@ -1,282 +1,251 @@
-<div align="center">
+# FastNN
 
-# ⚡ FastNN
+A deep learning library in Rust, with CUDA kernels for the parts that matter.
 
-**A GPU-accelerated deep learning framework built from scratch in Rust and CUDA.**
-
-Tensors, reverse-mode autograd, neural-network layers, optimizers, and data loading — no wrappers around PyTorch or TensorFlow, just hand-written math and CUDA kernels behind a clean, PyTorch-like API.
-
-![Rust](https://img.shields.io/badge/Rust-2021-000000?logo=rust&logoColor=white)
-![CUDA](https://img.shields.io/badge/CUDA-12%2F13-76B900?logo=nvidia&logoColor=white)
-![Backend](https://img.shields.io/badge/backend-CPU%20%2B%20CUDA-blue)
-![Tests](https://img.shields.io/badge/gradient--checked-41%20ops%20%E2%9C%93-success)
-![License](https://img.shields.io/badge/license-MIT-green)
-
-</div>
-
----
-
-## Highlights
-
-- **Dual CPU / CUDA backend.** Every tensor op has a pure-Rust path and a CUDA path; dispatch is automatic based on where the tensor lives. Develop on CPU, train on GPU, no code changes.
-- **Reverse-mode autograd.** A tape-based engine records every operation and replays it backward — the same model definition trains end to end.
-- **Gradient-checked correctness.** Every backward pass is verified against finite differences (41 ops) and every CUDA kernel against its CPU reference (14 parity checks). See [Testing](#testing).
-- **Real models train.** Ships with working MLP, CNN (Conv + BatchNorm + MaxPool), and a GPT-style character language model with multi-head causal attention.
-- **cuBLAS-backed GEMM** with TF32 tensor cores, a stream-ordered buffer cache, and transpose-fused matmul so the backward pass allocates nothing extra.
-- **No unsafe surprises.** GPU memory is RAII-managed (`CudaBuffer` frees on drop); CPU ops are Rayon-parallel.
-
----
-
-## Quick Start
-
-```toml
-# Cargo.toml
-[dependencies]
-fastnn = { path = "." }
-```
-
-```bash
-# CPU-only — no CUDA toolkit required, ideal for development
-cargo build --release --no-default-features
-
-# Full GPU build
-cargo build --release
-```
+Tensors with autograd, the usual layers, optimizers, data loading, and
+checkpoints — small enough to read end to end, and it actually trains.
 
 ```rust
 use fastnn::prelude::*;
-use fastnn::autograd::graph;
+use fastnn::data::{Mnist, Split};
 
-// Define a model by composing Modules.
+let train = Mnist::load(Split::Train)?;
+let loader = DataLoader::new(&train, 128).shuffle(true);
+
 let model = Sequential::new()
-    .add(Linear::new(784, 256))
+    .add(Flatten::new())
+    .add(Linear::new(784, 128))
     .add(ReLU)
-    .add(Dropout::new(0.2))
-    .add(Linear::new(256, 10));
+    .add(Linear::new(128, 10));
 
-let loss_fn = CrossEntropyLoss::new();
-let mut optimizer = Adam::new(1e-3);
+let mut opt = Adam::new(model.parameters(), 1e-3);
 
-// One training step.
-graph::enable_grad();
-{
-    let mut params = model.parameters_mut();
-    optimizer.zero_grad(&mut params);
+for batch in loader.iter() {
+    let loss = cross_entropy(&model.forward(&batch.inputs), &batch.labels());
+
+    opt.zero_grad();
+    loss.backward();
+    opt.step();
 }
 
-let logits = model.forward(&inputs);          // [batch, 10]
-let loss = loss_fn.forward(&logits, &targets); // scalar
-loss.backward();                               // fills every .grad()
-
-{
-    let mut params = model.parameters_mut();
-    optimizer.step(&mut params);               // updates weights in place
-}
-graph::disable_grad();
+save(&model, "mnist.fdl")?;
 ```
 
-Move a model to the GPU by transferring its tensors — the same `forward`/`backward` code then runs on CUDA:
+No gradient-mode flags, no borrow dance around the optimizer. That is the whole
+training loop.
 
-```rust
-let x_gpu = x.cuda();      // upload to VRAM
-let y = model.forward(&x_gpu);
-let y_cpu = y.cpu();       // bring the result back
-```
-
----
-
-## Examples
+## Getting started
 
 ```bash
-# XOR with a small MLP — fastest way to see the training loop
+# CPU only — no CUDA toolkit needed
 cargo run --example simple_mlp --no-default-features --release
 
-# MNIST digit classifier (MLP)
-cargo run --example mnist_mlp  --no-default-features --release
-
-# MNIST CNN: Conv2d + BatchNorm + ReLU + MaxPool + Linear head
-cargo run --example mnist_cnn  --no-default-features --release
-
-# GPT-style character language model: causal attention, gradient
-# clipping, LR warmup, and autoregressive text generation
-cargo run --example char_lm    --no-default-features --release
+# With a GPU
+cargo run --example mnist_mlp --release
 ```
 
-`char_lm` trains a ~4.8M-parameter Transformer (block 128, 256-dim, 8 heads, 6 layers) on the
-tiny-Shakespeare corpus. On an RTX 4050 Laptop GPU it runs at **~9 training steps/sec** and drives
-loss from 5.4 to ~1.3, producing recognizable Shakespearean prose. Pass a text file as the first
-argument to train on your own corpus.
+Always use `--release`. Debug builds are roughly 50× slower.
 
-> `simple_mlp`, `mnist_mlp`, `mnist_cnn`, and `char_lm` are the maintained, end-to-end-trainable
-> references. `mnist.rs` and `transformer.rs` are older forward-only sketches kept for reference.
-
----
-
-## What's Included
-
-### Layers (`Module` trait)
-
-| Category | Layers |
+| Example | What it shows |
 |---|---|
-| Core | `Linear`, `Conv2d`, `Flatten`, `Sequential` |
-| Recurrent | `LSTM`, `GRU` |
-| Attention | `MultiHeadAttention`, `TransformerEncoderLayer`, `TransformerEncoder` |
-| Embeddings | `Embedding`, `PositionalEncoding` |
-| Normalization | `BatchNorm2d`, `LayerNorm`, `RMSNorm` |
-| Pooling | `MaxPool2d`, `AvgPool2d`, `AdaptiveAvgPool2d` |
-| Regularization | `Dropout` |
+| `simple_mlp` | The smallest complete training loop (XOR) |
+| `mnist_mlp` | Dataset loading, batching, evaluation, checkpointing |
+| `mnist_cnn` | Convolutions, batch norm, pooling, an LR schedule |
+| `char_lm` | A GPT-style transformer, trained from scratch, that generates text |
 
-### Activations, Losses, Optimizers, Schedulers
+`char_lm` takes a corpus path, or trains on a small embedded one:
 
-| | |
-|---|---|
-| **Activations** | `ReLU`, `GELU`, `SiLU`, `Sigmoid`, `Tanh`, `LeakyReLU`, `Softmax`, `log_softmax` |
-| **Losses** | `CrossEntropyLoss`, `MSELoss`, `BCELoss`, `BCEWithLogitsLoss` |
-| **Optimizers** | `SGD` (+ momentum/Nesterov), `Adam`, `AdamW`; plus `clip_grad_norm` |
-| **Schedulers** | `StepLR`, `CosineAnnealingLR`, `LinearWarmup`, `OneCycleLR` |
-
-### Tensor operations
-
-| Category | Operations |
-|---|---|
-| Constructors | `zeros`, `ones`, `full`, `rand`, `randn`, `arange`, `from_vec`, `kaiming_uniform`, `xavier_uniform` |
-| Arithmetic | `add`, `sub`, `mul`, `div`, `neg`, `abs`, `pow_scalar`, `add_scalar`, `mul_scalar` |
-| Linear algebra | `matmul`, `matmul_nt` (A·Bᵀ), `matmul_tn` (Aᵀ·B), batched 3D matmul — all cuBLAS |
-| Math | `exp`, `log`, `sqrt`, `clamp` |
-| Shape | `reshape`, `flatten`, `transpose`, `permute`, `expand` |
-| Reductions | `sum`, `mean`, `max_val`, `min_val`, `var`, `sum_axis`, `mean_axis`, `argmax` |
-| Device | `cuda()`, `cpu()`, `to_device()`, `item()` |
-
-Autograd is wired through every differentiable op above, so models built from `Tensor`/`Module`
-calls train without any manual gradient code.
-
----
-
-## Architecture
-
-```
-fastnn/
-├── cuda/
-│   ├── kernels.cu          # all GPU kernels (single translation unit)
-│   ├── include/kernels.h   # C FFI surface
-│   └── stubs.c             # link-time no-ops for CPU-only builds
-├── src/
-│   ├── tensor/             # Tensor type, ops (CPU/CUDA dispatch), FFI bindings
-│   ├── autograd/           # tape-based graph + Variable + GradFn backward ops
-│   ├── nn/                 # Module trait and all layers
-│   ├── optim/              # SGD / Adam / AdamW + LR schedulers
-│   ├── data/               # Dataset trait + batching/shuffling DataLoader
-│   ├── cuda/               # CUDA context + RAII CudaBuffer (with buffer cache)
-│   └── serialize/          # .fdl checkpoint format
-├── tests/                  # gradcheck.rs, cuda_parity.rs
-└── examples/
+```bash
+curl -o shakespeare.txt \
+  https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt
+cargo run --example char_lm --release -- shakespeare.txt
 ```
 
-**Design notes**
+## How it fits together
 
-- **Dual-backend dispatch.** A `Tensor` is either `TensorStorage::Cpu(Vec<f32>)` or
-  `TensorStorage::Cuda(Arc<CudaBuffer>)`; each op picks the matching path automatically.
-- **cuBLAS for GEMM.** Matrix multiply uses `Sgemm`/`SgemmStridedBatched` with TF32 tensor cores.
-  The backward pass uses transpose-fused variants (`CUBLAS_OP_T`) so it never allocates transpose buffers.
-- **Convolution = im2col + GEMM**, reusing the optimized matmul path.
-- **Pre-LN Transformer**, the stable variant used by modern GPT-style models.
-- **Stream-ordered buffer cache.** `CudaBuffer` recycles freed allocations by size, eliminating
-  per-step `cudaMalloc` overhead during training.
-- **Tape autograd.** Operations append `GradFn` nodes to a thread-local graph; `backward()` walks
-  it in reverse, seeding the loss gradient on the loss tensor's own device.
+```
+  data      Dataset ─► DataLoader ─► Batch
+                                       │
+  nn        Module ──► forward ────────┤    layers hold Param handles
+                                       ▼
+  tensor    Tensor ops on CPU or CUDA ─┴─► loss
+                                       │
+  autograd  loss.backward() walks the graph the ops built,
+            depositing gradients in each Param's slot
+                                       │
+  optim     opt.step() reads those slots and updates in place
+```
 
----
+Everything starts on the CPU. `model.to_device(device)` moves a model,
+`DataLoader::to_device` moves its batches, and mixing the two panics rather than
+copying behind your back.
+
+```rust
+let device = Device::best();       // GPU if there is one, else CPU
+model.to_device(device);
+let loader = DataLoader::new(&dataset, 64).to_device(device);
+```
+
+### Two ideas worth knowing
+
+**The graph is the tensors.** There is no tape and no global state. A tensor
+produced by a differentiable op carries a node naming the rule that made it and
+the tensors it consumed, so `loss.backward()` just walks that structure. Drop the
+loss and the graph frees itself. A tensor with no node is plain data, so there is
+no `requires_grad` flag to keep in sync — wrap inference in `no_grad(|| ...)`
+when you want to skip building a graph at all.
+
+**Parameters are shared slots.** `Param` is a handle, not a value. The model and
+the optimizer hold handles to the same weight and the same gradient, which is why
+`opt.step()` needs no borrow of the model. It is also why weight tying works
+without special support: use the same handle twice and both paths' gradients add
+up on their own.
+
+## Layout
+
+Every file is one idea, and none are long. 67 files, ~7,000 lines.
+
+```
+src/
+  tensor/          the array type and everything you can do to it
+    core.rs          Tensor: shape, storage, graph link
+    shape.rs         strides, broadcasting, index math
+    storage.rs       the bytes, on one device or the other
+    device.rs        Device::cuda(0) -> Result
+    init.rs          zeros, randn, kaiming, xavier, ...
+    ops/             one file per category
+      arith  unary  activation  matmul  reduce  view  index
+      conv  pool  norm
+
+  autograd/        reverse-mode differentiation
+    node.rs          Backward trait, graph nodes, gradient slots
+    engine.rs        the reverse pass
+    mode.rs          no_grad
+    ops/             one backward rule per forward op, same file names
+
+  nn/              layers, all implementing Module
+    module.rs param.rs sequential.rs linear.rs conv.rs pooling.rs
+    norm.rs activation.rs dropout.rs shape.rs embedding.rs
+    attention.rs transformer.rs rnn.rs loss.rs
+
+  optim/           sgd.rs  adam.rs  schedule.rs
+  data/            dataset.rs  loader.rs  mnist.rs
+  serialize/       checkpoint.rs
+  cuda/            ffi.rs (raw bindings)  kernels.rs (safe wrappers)  buffer.rs
+  rng.rs  error.rs  lib.rs
+
+cuda/kernels.cu    all GPU kernels
+```
+
+`tensor/ops/` and `autograd/ops/` mirror each other file for file: the forward
+for `relu` is in `tensor/ops/activation.rs`, its derivative in
+`autograd/ops/activation.rs`.
+
+## Extending it
+
+**A new layer.** Implement `forward`, plus `named_parameters` if it has weights.
+Device placement, parameter counting, and gradient zeroing come from those.
+
+```rust
+struct Residual { inner: Linear }
+
+impl Module for Residual {
+    fn forward(&self, x: &Tensor) -> Tensor {
+        x.add(&self.inner.forward(x).relu())
+    }
+    fn named_parameters(&self) -> Vec<(String, Param)> {
+        scoped("inner", self.inner.named_parameters())
+    }
+}
+```
+
+**A new op.** Write the forward in `tensor/ops/`, the rule in `autograd/ops/`,
+attach it with `with_grad`, and add a check to `tests/gradcheck.rs`.
+
+```rust
+// tensor/ops/unary.rs
+pub fn softplus(&self) -> Tensor {
+    unary_op(self, |x| x.exp().ln_1p(), ffi::fastnn_cuda_softplus)
+        .with_grad(&[self], || SoftplusBackward { input: self.detach() })
+}
+
+// autograd/ops/unary.rs
+impl Backward for SoftplusBackward {
+    fn backward(&self, grad: &Tensor) -> Vec<Tensor> {
+        vec![elementwise(grad, &self.input, |x| 1.0 / (1.0 + (-x).exp()))]
+    }
+    fn name(&self) -> &'static str { "Softplus" }
+}
+```
+
+The rule's gradients must come back in the same order as the inputs. Save
+detached tensors — a saved value that still carries its own node would pin the
+graph that produced it.
+
+**A new dataset.** Implement `Dataset` and hand it to a `DataLoader`. Items are
+written into caller-provided slices rather than returned as tensors, so batching
+60,000 images does not build 60,000 throwaway ones.
+
+## Errors
+
+Tensor maths panics on shape and device mistakes. Those are bugs in the calling
+code, like indexing past the end of a slice, and threading `Result` through every
+`add` would bury the model in `?` for no safety gained.
+
+`Result` is for what genuinely fails at runtime:
+
+```rust
+let device = Device::cuda(0)?;      // no GPU
+let data   = Mnist::load(Split::Train)?;  // download or parse failed
+load(&model, "model.fdl")?;          // missing file, or a shape that moved
+```
 
 ## Testing
 
-Correctness is enforced by two suites, not by "the loss went down."
-
 ```bash
-# Finite-difference gradient checks for every op (CPU, no GPU needed)
-cargo test --no-default-features --test gradcheck
-
-# CUDA-vs-CPU forward + backward equivalence for custom kernels
-cargo test --test cuda_parity -- --test-threads=1
+cargo test --no-default-features --test gradcheck   # every backward rule
+cargo test --test cuda_parity -- --test-threads=1   # CPU vs GPU
+cargo test --no-default-features                    # everything
+cargo bench --no-default-features                   # throughput
 ```
 
-- **`gradcheck.rs`** verifies each backward against the central finite difference
-  `(L(x+h) − L(x−h)) / 2h` using a random upstream gradient. 41 checks, including the fused
-  `CrossEntropy`, `MSE`, and `LayerNorm` paths.
-- **`cuda_parity.rs`** runs each custom-kernel op (matmul variants, permute, sum-axis, LayerNorm,
-  activations) on both backends and asserts the forward and gradients agree.
+`gradcheck` checks every backward rule against central finite differences of its
+own forward. It is the reason the autograd layer can be trusted; a new rule
+without a test there is not finished.
 
-CI (`.github/workflows/ci.yml`) runs the CPU build and gradient checks on every push.
+`cuda_parity` runs each op on both devices and compares. It skips itself with a
+note when there is no GPU, so a CPU-only machine still gets a green run. It found
+a real bug in the softmax kernel: the block reduction assumed a power-of-two
+thread count and silently dropped the tail of every row whose width was not one —
+which included MNIST's ten classes and any odd sequence length.
 
----
+## CUDA
 
-## CUDA Requirements
+Needs the NVIDIA CUDA Toolkit; set `CUDA_PATH` or `CUDA_HOME` if it is not in the
+default location. `build.rs` compiles `cuda/kernels.cu` with `nvcc` and links
+`cudart`, `cublas`, and `curand`. Compute capabilities 7.5 through 9.0 (Turing
+through Hopper).
 
-| Requirement | Version |
-|---|---|
-| NVIDIA CUDA Toolkit | 12.x or 13.x |
-| GPU compute capability | 7.5+ |
-| Architectures built | Turing (7.5), Ampere (8.0 / 8.6), Ada Lovelace (8.9), Hopper (9.0) |
+`--no-default-features` skips all of that: `cuda/stubs.c` supplies the symbols,
+`Device::cuda(0)` returns an error, and everything runs on the CPU.
 
-`build.rs` compiles `cuda/kernels.cu` with `nvcc` and links `cudart`, `cublas`, and `curand`. Set
-`CUDA_PATH` or `CUDA_HOME` if the toolkit is not in the default location. CPU-only builds
-(`--no-default-features`) need no toolkit at all — `cuda/stubs.c` supplies link-time symbols.
+Two things carry most of the GPU performance. Matrix multiplication goes through
+cuBLAS, and the two transposed forms the backward pass needs (`matmul_nt`,
+`matmul_tn`) use a transpose flag rather than building a transposed copy. GPU
+allocations come from a size-keyed free list, so the many short-lived temporaries
+a training step creates cost a hash lookup instead of a driver round trip.
 
-> **Note:** under a very new host compiler (e.g. GCC 16), pin `nvcc`'s host compiler with
-> `-ccbin=g++-15`; the build script already does this.
+## Limitations
 
----
-
-## Build & Test Reference
-
-```bash
-cargo build --release                      # GPU build
-cargo build --release --no-default-features # CPU-only
-cargo check  --no-default-features          # fast type-check
-cargo test   --no-default-features          # unit + integration tests
-cargo bench  --no-default-features          # criterion benchmarks
-```
-
-Always build non-trivial models with `--release`; debug mode is roughly 50× slower.
-
----
-
-## Current Limitations
-
-FastNN is a focused, from-scratch implementation. Known gaps:
-
-- `LayerNorm` γ/β are trained on the **CUDA path only**; the CPU path propagates dL/dx but not the parameter gradients.
-- `Cat`/`Stack` and `Squeeze`/`Unsqueeze` have no backward pass yet.
-- `AdaptiveAvgPool2d` has no backward pass.
-- Single-GPU only; no mixed precision (f16/bf16 is a placeholder feature flag).
-- Several public APIs `panic!` on misuse rather than returning `Result`.
-
----
-
-## Roadmap
-
-- [ ] `Result`-based error handling across the public API
-- [ ] LayerNorm γ/β gradients on the CPU path
-- [ ] `Cat`/`Stack`/`Squeeze`/`Unsqueeze` backward
-- [ ] Mixed-precision training (FP16 / BF16)
-- [ ] Gradient checkpointing for deeper models
-- [ ] Multi-GPU data parallelism
-- [ ] Built-in dataset downloaders (MNIST, CIFAR-10)
-- [ ] Flash-Attention-style fused attention
-
----
-
-## Contributing
-
-Contributions are welcome. Please open an issue to discuss significant changes first.
-New ops must ship with a gradient check in `tests/gradcheck.rs` (and a parity test if they add a CUDA kernel).
-
-```bash
-git checkout -b feature/my-feature
-cargo test --no-default-features --test gradcheck   # must pass
-```
-
----
+- `f32` only.
+- Convolution unfolds to a matrix multiply, and the unfold itself runs on the
+  host. The multiply is on the GPU; the `im2col` around it is not.
+- `LSTM` and `GRU` are built from ordinary differentiable ops, one graph node per
+  gate per timestep. Correct, and fine for short sequences — use a transformer
+  for long ones.
+- Tensors are always contiguous. `permute` and `expand` write a new buffer rather
+  than returning a strided view.
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT.
