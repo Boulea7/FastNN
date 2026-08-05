@@ -1,51 +1,113 @@
-//! # FastNN — GPU-Accelerated Deep Learning Library
+//! # FastNN
 //!
-//! A deep learning library built from scratch in Rust with CUDA GPU acceleration.
+//! A deep learning library in Rust, with CUDA kernels for the parts that matter.
 //!
-//! ## Quick Start
-//!
-//! ```rust,no_run
+//! ```no_run
 //! use fastnn::prelude::*;
+//! use fastnn::data::{Mnist, Split};
 //!
-//! // Create tensors
-//! let x = Tensor::randn(&[32, 784]);
+//! # fn main() -> fastnn::Result<()> {
+//! let train = Mnist::load(Split::Train)?;
+//! let loader = DataLoader::new(&train, 128).shuffle(true);
+//!
 //! let model = Sequential::new()
-//!     .add(Linear::new(784, 256))
+//!     .add(Flatten::new())
+//!     .add(Linear::new(784, 128))
 //!     .add(ReLU)
-//!     .add(Linear::new(256, 10));
+//!     .add(Linear::new(128, 10));
 //!
-//! let output = model.forward(&x);
+//! let mut opt = Adam::new(model.parameters(), 1e-3);
+//!
+//! for batch in loader.iter() {
+//!     let loss = cross_entropy(&model.forward(&batch.inputs), &batch.labels());
+//!
+//!     opt.zero_grad();
+//!     loss.backward();
+//!     opt.step();
+//! }
+//!
+//! save(&model, "mnist.fdl")?;
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! ## How it fits together
+//!
+//! ```text
+//!   data     Dataset ─► DataLoader ─► Batch
+//!                                       │
+//!   nn       Module ──► forward ────────┤   layers hold Param handles
+//!                                       ▼
+//!   tensor   Tensor ops on CPU or CUDA ─┴─► loss
+//!                                       │
+//!   autograd loss.backward() walks the graph the ops built,
+//!            depositing gradients in each Param's slot
+//!                                       │
+//!   optim    opt.step() reads those slots and updates in place
+//! ```
+//!
+//! Each layer is one module directory and is documented where it lives:
+//!
+//! - [`tensor`] — the array type, its ops, and CPU/CUDA dispatch
+//! - [`autograd`] — the graph the ops build and the reverse pass over it
+//! - [`nn`] — layers, [`Param`](nn::Param) handles, and losses
+//! - [`optim`] — optimizers and learning-rate schedules
+//! - [`data`] — datasets, batching, MNIST
+//! - [`serialize`] — checkpoints
+//! - [`cuda`] — GPU memory and the kernel bindings
+//!
+//! ## Errors
+//!
+//! Tensor maths panics on shape and device mistakes — those are bugs in the
+//! calling code, like indexing past the end of a slice. [`Result`] is for things
+//! that genuinely fail at runtime: I/O, dataset downloads, and CUDA.
+//!
+//! ## Devices
+//!
+//! Everything starts on the CPU. [`Module::to_device`](nn::Module::to_device)
+//! moves a model, [`DataLoader::to_device`](data::DataLoader::to_device) moves
+//! its batches, and mixing the two panics rather than copying silently.
+//!
+//! ```no_run
+//! # use fastnn::prelude::*;
+//! # let model = Sequential::new();
+//! # let dataset: fastnn::data::TensorDataset = unimplemented!();
+//! let device = Device::best();
+//! model.to_device(device);
+//! let loader = DataLoader::new(&dataset, 64).to_device(device);
 //! ```
 
-pub mod tensor;
 pub mod autograd;
+pub mod cuda;
+pub mod data;
+pub mod error;
 pub mod nn;
 pub mod optim;
-pub mod data;
-pub mod cuda;
+pub mod rng;
 pub mod serialize;
-pub mod utils;
+pub mod tensor;
 
-/// Prelude — import everything you need with `use fastnn::prelude::*`.
+pub use error::{Error, Result};
+
+/// Everything you need for a training script.
+///
+/// ```
+/// use fastnn::prelude::*;
+/// ```
 pub mod prelude {
-    pub use crate::tensor::{Tensor, Device};
+    pub use crate::autograd::no_grad;
+    pub use crate::data::{Batch, DataLoader, Dataset, TensorDataset};
     pub use crate::nn::{
-        Module, Sequential, Linear, Conv2d, Flatten,
-        ReLU, Sigmoid, Tanh, GELU, SiLU, LeakyReLU, Softmax,
-        BatchNorm2d, LayerNorm, RMSNorm,
-        Dropout,
-        MaxPool2d, AvgPool2d, AdaptiveAvgPool2d,
-        LSTM, GRU,
-        MultiHeadAttention, TransformerEncoderLayer, TransformerEncoder,
-        Embedding,
-        CrossEntropyLoss, MSELoss, BCELoss, BCEWithLogitsLoss,
+        bce, bce_with_logits, cross_entropy, mae, mse, AdaptiveAvgPool2d, AvgPool2d, BatchNorm2d,
+        Buffer, Conv2d, Dropout, Embedding, Flatten, LayerNorm, LeakyReLU, Linear, MaxPool2d,
+        Module, MultiHeadAttention, Param, PositionalEncoding, RMSNorm, ReLU, Reshape, Sequential,
+        Sigmoid, SiLU, Softmax, Tanh, TransformerBlock, TransformerStack, GELU, GRU, LSTM,
     };
-    pub use crate::optim::{Optimizer, SGD, Adam, AdamW, clip_grad_norm};
-    pub use crate::optim::{LRScheduler, StepLR, CosineAnnealingLR, LinearWarmup, OneCycleLR};
-    pub use crate::data::{Dataset, DataLoader};
-    pub use crate::autograd::{Variable, BackwardGraph};
-    pub use crate::autograd::graph::{enable_grad, disable_grad, is_grad_enabled};
-    pub use crate::serialize::{save_model, load_model, save_tensors, load_tensors};
-    pub use crate::cuda::CudaContext;
-    pub use crate::utils::random::manual_seed;
+    pub use crate::optim::{
+        clip_grad_norm, Adam, AdamW, Constant, CosineAnnealing, LrSchedule, OneCycle, Optimizer,
+        StepDecay, Warmup, SGD,
+    };
+    pub use crate::rng::manual_seed;
+    pub use crate::serialize::{load, save};
+    pub use crate::tensor::{Device, Tensor, Window};
 }
