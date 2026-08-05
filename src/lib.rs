@@ -95,7 +95,7 @@ pub use error::{Error, Result};
 /// use fastnn::prelude::*;
 /// ```
 pub mod prelude {
-    pub use crate::autograd::no_grad;
+    pub use crate::autograd::{detect_anomaly, no_grad};
     pub use crate::data::{Batch, DataLoader, Dataset, TensorDataset};
     pub use crate::nn::{
         bce, bce_with_logits, cross_entropy, mae, mse, AdaptiveAvgPool2d, AvgPool2d, BatchNorm2d,
@@ -105,9 +105,9 @@ pub mod prelude {
     };
     pub use crate::optim::{
         clip_grad_norm, Adam, AdamW, Constant, CosineAnnealing, LrSchedule, OneCycle, Optimizer,
-        StepDecay, Warmup, SGD,
+        OptimizerState, StepDecay, Warmup, SGD,
     };
     pub use crate::rng::manual_seed;
-    pub use crate::serialize::{load, save};
+    pub use crate::serialize::{load, load_training, save, save_training};
     pub use crate::tensor::{Device, Tensor, Window};
 }
