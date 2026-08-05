@@ -1,45 +1,61 @@
+//! Activations as layers, for use inside [`Sequential`](super::Sequential).
+//!
+//! Each one is a thin wrapper over the corresponding [`Tensor`] method — call
+//! that directly when you are writing a `forward` by hand.
+
 use crate::tensor::Tensor;
-use crate::nn::module::Module;
 
-pub struct ReLU;
-impl Module for ReLU {
-    fn forward(&self, input: &Tensor) -> Tensor { input.relu() }
+use super::module::Module;
+
+/// Declare a stateless activation layer that forwards to one tensor method.
+macro_rules! activation {
+    ($(#[$doc:meta])* $name:ident => $method:ident) => {
+        $(#[$doc])*
+        pub struct $name;
+
+        impl Module for $name {
+            fn forward(&self, input: &Tensor) -> Tensor {
+                input.$method()
+            }
+        }
+    };
 }
 
-pub struct Sigmoid;
-impl Module for Sigmoid {
-    fn forward(&self, input: &Tensor) -> Tensor { input.sigmoid() }
-}
+activation!(/// `max(0, x)`.
+            ReLU => relu);
+activation!(/// `1 / (1 + e^-x)`.
+            Sigmoid => sigmoid);
+activation!(/// Hyperbolic tangent.
+            Tanh => tanh);
+activation!(/// Exact GELU — the transformer default.
+            GELU => gelu);
+activation!(/// SiLU / swish, `x · sigmoid(x)`.
+            SiLU => silu);
+activation!(/// Softmax over the last dimension.
+            ///
+            /// Not needed before [`cross_entropy`](super::cross_entropy), which
+            /// applies its own and is more stable for it.
+            Softmax => softmax);
 
-pub struct Tanh;
-impl Module for Tanh {
-    fn forward(&self, input: &Tensor) -> Tensor { input.tanh_act() }
-}
-
-pub struct GELU;
-impl Module for GELU {
-    fn forward(&self, input: &Tensor) -> Tensor { input.gelu() }
-}
-
-pub struct SiLU;
-impl Module for SiLU {
-    fn forward(&self, input: &Tensor) -> Tensor { input.silu() }
-}
-
+/// ReLU with a non-zero slope for negative inputs, so units cannot go fully dead.
 pub struct LeakyReLU {
-    pub negative_slope: f32,
-}
-impl LeakyReLU {
-    pub fn new(negative_slope: f32) -> Self { LeakyReLU { negative_slope } }
-}
-impl Default for LeakyReLU {
-    fn default() -> Self { LeakyReLU { negative_slope: 0.01 } }
-}
-impl Module for LeakyReLU {
-    fn forward(&self, input: &Tensor) -> Tensor { input.leaky_relu(self.negative_slope) }
+    pub slope: f32,
 }
 
-pub struct Softmax;
-impl Module for Softmax {
-    fn forward(&self, input: &Tensor) -> Tensor { input.softmax() }
+impl LeakyReLU {
+    pub fn new(slope: f32) -> LeakyReLU {
+        LeakyReLU { slope }
+    }
+}
+
+impl Default for LeakyReLU {
+    fn default() -> Self {
+        LeakyReLU { slope: 0.01 }
+    }
+}
+
+impl Module for LeakyReLU {
+    fn forward(&self, input: &Tensor) -> Tensor {
+        input.leaky_relu(self.slope)
+    }
 }

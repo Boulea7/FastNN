@@ -1,121 +1,82 @@
-use std::collections::HashMap;
-use crate::tensor::Tensor;
-use crate::nn::module::Module;
+//! Fully connected layer.
 
-/// Fully connected (dense) layer: y = xW^T + b
+use crate::tensor::Tensor;
+
+use super::module::Module;
+use super::param::Param;
+
+/// `y = x · Wᵀ + b`.
+///
+/// Accepts any input whose last dimension is `in_features`; leading dimensions
+/// are flattened into the batch and restored on the way out, so the same layer
+/// serves `[batch, features]` and `[batch, sequence, features]`.
 pub struct Linear {
-    pub weight: Tensor,
-    pub bias: Option<Tensor>,
+    pub weight: Param,
+    pub bias: Option<Param>,
     in_features: usize,
     out_features: usize,
 }
 
 impl Linear {
-    pub fn new(in_features: usize, out_features: usize) -> Self {
-        // Kaiming uniform initialization
-        let weight = Tensor::kaiming_uniform(&[out_features, in_features], in_features);
-        let bound = 1.0 / (in_features as f32).sqrt();
-        let bias = Tensor::from_vec(
-            (0..out_features).map(|_| {
-                use rand::Rng;
-                rand::thread_rng().gen_range(-bound..bound)
-            }).collect(),
-            &[out_features],
-        );
-
-        let mut w = weight;
-        w.set_requires_grad(true);
-        let mut b = bias;
-        b.set_requires_grad(true);
-
+    /// A layer with bias, Kaiming-initialised.
+    pub fn new(in_features: usize, out_features: usize) -> Linear {
         Linear {
-            weight: w,
-            bias: Some(b),
+            weight: Param::new(Tensor::kaiming_uniform(&[out_features, in_features], in_features)),
+            bias: Some(Param::new(uniform_bias(out_features, in_features))),
             in_features,
             out_features,
         }
     }
 
-    /// Create a linear layer without bias.
-    pub fn no_bias(in_features: usize, out_features: usize) -> Self {
-        let weight = Tensor::kaiming_uniform(&[out_features, in_features], in_features);
-        let mut w = weight;
-        w.set_requires_grad(true);
-
+    /// A layer with no bias — the usual choice when a normalization layer with
+    /// its own shift follows immediately.
+    pub fn no_bias(in_features: usize, out_features: usize) -> Linear {
         Linear {
-            weight: w,
             bias: None,
-            in_features,
-            out_features,
+            ..Linear::new(in_features, out_features)
         }
+    }
+
+    pub fn in_features(&self) -> usize {
+        self.in_features
+    }
+
+    pub fn out_features(&self) -> usize {
+        self.out_features
     }
 }
 
 impl Module for Linear {
     fn forward(&self, input: &Tensor) -> Tensor {
-        // input: [batch, in_features] or [batch, seq_len, in_features]
-        // weight: [out_features, in_features]
-        // output: [batch, out_features] or [batch, seq_len, out_features]
+        assert_eq!(
+            input.last_dim(), self.in_features,
+            "Linear expects {} input features, got {:?}", self.in_features, input.shape()
+        );
 
-        let input_shape = input.shape().to_vec();
-        let ndim = input_shape.len();
+        // `matmul_nt` consumes the weight as stored, [out, in], with no transposed copy.
+        let flat = input.reshape(&[-1, self.in_features as i64]);
+        let mut out = flat.matmul_nt(&self.weight.tensor());
 
-        // Flatten all batch dimensions, keep last as features
-        let features = input_shape[ndim - 1];
-        assert_eq!(features, self.in_features,
-                   "Expected input features {}, got {}", self.in_features, features);
-
-        let batch_size: usize = input_shape[..ndim - 1].iter().product();
-
-        // Reshape to [batch, in_features]
-        let input_2d = input.reshape(&[batch_size as i64, self.in_features as i64]);
-
-        // y = x @ W^T
-        let weight_t = self.weight.transpose();
-        let mut output = input_2d.matmul(&weight_t);
-
-        // Add bias
-        if let Some(ref bias) = self.bias {
-            let bias_expanded = bias.reshape(&[1, self.out_features as i64])
-                .expand(&[batch_size, self.out_features]);
-            output = output.add(&bias_expanded);
+        if let Some(bias) = &self.bias {
+            out = out.add(&bias.tensor().reshape(&[1, self.out_features as i64]));
         }
 
-        // Reshape back to original batch dimensions
-        let mut out_shape: Vec<i64> = input_shape[..ndim - 1].iter().map(|&s| s as i64).collect();
-        out_shape.push(self.out_features as i64);
-        output.reshape(&out_shape)
+        let mut shape: Vec<i64> = input.shape()[..input.ndim() - 1].iter().map(|&d| d as i64).collect();
+        shape.push(self.out_features as i64);
+        out.reshape(&shape)
     }
 
-    fn parameters(&self) -> Vec<Tensor> {
-        let mut params = vec![self.weight.clone()];
-        if let Some(ref bias) = self.bias {
-            params.push(bias.clone());
+    fn named_parameters(&self) -> Vec<(String, Param)> {
+        let mut params = vec![("weight".into(), self.weight.clone())];
+        if let Some(bias) = &self.bias {
+            params.push(("bias".into(), bias.clone()));
         }
         params
     }
+}
 
-    fn parameters_mut(&mut self) -> Vec<&mut Tensor> {
-        let mut params = vec![&mut self.weight];
-        if let Some(ref mut bias) = self.bias {
-            params.push(bias);
-        }
-        params
-    }
-
-    fn named_parameters(&self) -> HashMap<String, Tensor> {
-        let mut params = HashMap::new();
-        params.insert("weight".to_string(), self.weight.clone());
-        if let Some(ref bias) = self.bias {
-            params.insert("bias".to_string(), bias.clone());
-        }
-        params
-    }
-
-    fn to_device(&mut self, device: crate::tensor::Device) {
-        self.weight = self.weight.to_device(device);
-        if let Some(ref mut b) = self.bias {
-            *b = b.to_device(device);
-        }
-    }
+/// PyTorch's linear bias init: uniform over `±1/√fan_in`.
+fn uniform_bias(out_features: usize, fan_in: usize) -> Tensor {
+    let bound = 1.0 / (fan_in as f32).sqrt();
+    Tensor::uniform(&[out_features], -bound, bound)
 }
