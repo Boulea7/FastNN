@@ -1,83 +1,110 @@
-use crate::tensor::Tensor;
-use crate::optim::Optimizer;
+//! Stochastic gradient descent.
 
-/// Stochastic Gradient Descent with optional momentum and weight decay.
+use crate::nn::Param;
+use crate::tensor::Tensor;
+
+use super::Optimizer;
+
+/// Plain SGD, optionally with momentum, Nesterov lookahead, and weight decay.
+///
+/// ```
+/// # use fastnn::prelude::*;
+/// # let model = Sequential::new().add(Linear::new(4, 2));
+/// let mut opt = SGD::new(model.parameters(), 0.1)
+///     .momentum(0.9)
+///     .weight_decay(5e-4);
+/// ```
 pub struct SGD {
+    params: Vec<Param>,
+    velocity: Vec<Option<Tensor>>,
     lr: f32,
     momentum: f32,
-    weight_decay: f32,
     dampening: f32,
+    weight_decay: f32,
     nesterov: bool,
-    velocities: Vec<Option<Tensor>>,
 }
 
 impl SGD {
-    pub fn new(lr: f32) -> Self {
+    pub fn new(params: Vec<Param>, lr: f32) -> SGD {
         SGD {
+            velocity: vec![None; params.len()],
+            params,
             lr,
             momentum: 0.0,
-            weight_decay: 0.0,
             dampening: 0.0,
+            weight_decay: 0.0,
             nesterov: false,
-            velocities: Vec::new(),
         }
     }
 
-    pub fn momentum(mut self, momentum: f32) -> Self {
+    /// Carry a fraction of the previous update forward. 0.9 is the usual choice.
+    pub fn momentum(mut self, momentum: f32) -> SGD {
         self.momentum = momentum;
         self
     }
 
-    pub fn weight_decay(mut self, wd: f32) -> Self {
-        self.weight_decay = wd;
+    /// Damp how much of each new gradient enters the velocity.
+    pub fn dampening(mut self, dampening: f32) -> SGD {
+        self.dampening = dampening;
         self
     }
 
-    pub fn nesterov(mut self, nesterov: bool) -> Self {
+    /// L2 penalty, folded into the gradient.
+    pub fn weight_decay(mut self, decay: f32) -> SGD {
+        self.weight_decay = decay;
+        self
+    }
+
+    /// Apply the gradient at the point momentum is heading toward rather than
+    /// where it is now — a half-step of foresight that damps overshoot.
+    pub fn nesterov(mut self, nesterov: bool) -> SGD {
         self.nesterov = nesterov;
         self
     }
 }
 
 impl Optimizer for SGD {
-    fn step(&mut self, params: &mut [&mut Tensor]) {
-        if self.velocities.len() != params.len() {
-            self.velocities = vec![None; params.len()];
-        }
+    fn step(&mut self) {
+        for (index, param) in self.params.iter().enumerate() {
+            let Some(grad) = param.grad() else { continue };
+            let value = param.value();
 
-        for (i, param) in params.iter_mut().enumerate() {
-            let grad = match param.grad() {
-                Some(g) => g,
-                None => continue, // no grad recorded — skip (e.g. unused parameter)
-            };
-
-            let mut g = grad.clone();
-
-            // L2 regularization
+            let mut grad = grad;
             if self.weight_decay != 0.0 {
-                g = g.add(&param.mul_scalar(self.weight_decay));
+                grad = grad.add(&value.mul_scalar(self.weight_decay));
             }
 
-            let update = if self.momentum != 0.0 {
-                let v = match &self.velocities[i] {
-                    Some(v) => v.mul_scalar(self.momentum).add(&g.mul_scalar(1.0 - self.dampening)),
-                    None => g.clone(),
+            let update = if self.momentum == 0.0 {
+                grad
+            } else {
+                let velocity = match &self.velocity[index] {
+                    Some(previous) => previous
+                        .mul_scalar(self.momentum)
+                        .add(&grad.mul_scalar(1.0 - self.dampening)),
+                    None => grad.clone(),
                 };
                 let update = if self.nesterov {
-                    g.add(&v.mul_scalar(self.momentum))
+                    grad.add(&velocity.mul_scalar(self.momentum))
                 } else {
-                    v.clone()
+                    velocity.clone()
                 };
-                self.velocities[i] = Some(v);
+                self.velocity[index] = Some(velocity);
                 update
-            } else {
-                g
             };
 
-            param.apply_sgd_update(self.lr, &update);
+            param.set_value(value.sub(&update.mul_scalar(self.lr)));
         }
     }
 
-    fn get_lr(&self) -> f32 { self.lr }
-    fn set_lr(&mut self, lr: f32) { self.lr = lr; }
+    fn parameters(&self) -> &[Param] {
+        &self.params
+    }
+
+    fn lr(&self) -> f32 {
+        self.lr
+    }
+
+    fn set_lr(&mut self, lr: f32) {
+        self.lr = lr;
+    }
 }

@@ -1,175 +1,189 @@
-use crate::tensor::Tensor;
-use crate::optim::Optimizer;
+//! Adam and AdamW.
 
-/// Adam optimizer.
-pub struct Adam {
-    lr: f32,
+use crate::nn::Param;
+use crate::tensor::Tensor;
+
+use super::Optimizer;
+
+/// The moment estimates and update rule both optimizers share.
+struct Moments {
+    first: Vec<Option<Tensor>>,
+    second: Vec<Option<Tensor>>,
     beta1: f32,
     beta2: f32,
-    epsilon: f32,
-    weight_decay: f32,
-    step_count: usize,
-    m: Vec<Vec<f32>>,
-    v: Vec<Vec<f32>>,
-    initialized: bool,
+    eps: f32,
+    steps: u32,
 }
 
-impl Adam {
-    pub fn new(lr: f32) -> Self {
-        Adam {
-            lr,
+impl Moments {
+    fn new(count: usize) -> Moments {
+        Moments {
+            first: vec![None; count],
+            second: vec![None; count],
             beta1: 0.9,
             beta2: 0.999,
-            epsilon: 1e-8,
-            weight_decay: 0.0,
-            step_count: 0,
-            m: Vec::new(),
-            v: Vec::new(),
-            initialized: false,
+            eps: 1e-8,
+            steps: 0,
         }
     }
 
-    pub fn betas(mut self, beta1: f32, beta2: f32) -> Self {
-        self.beta1 = beta1;
-        self.beta2 = beta2;
+    /// How far to move parameter `index` given its gradient.
+    ///
+    /// Both moments start at zero and are therefore biased toward it early on;
+    /// dividing by `1 - βᵗ` corrects for that, which is what makes the first
+    /// few steps usable rather than vanishingly small.
+    fn update(&mut self, index: usize, grad: &Tensor) -> Tensor {
+        let first = blend(self.first[index].as_ref(), grad, self.beta1);
+        let second = blend(self.second[index].as_ref(), &grad.square(), self.beta2);
+
+        let correction1 = 1.0 - self.beta1.powi(self.steps as i32);
+        let correction2 = 1.0 - self.beta2.powi(self.steps as i32);
+        let mean = first.div_scalar(correction1);
+        let scale = second.div_scalar(correction2).sqrt().add_scalar(self.eps);
+
+        self.first[index] = Some(first);
+        self.second[index] = Some(second);
+        mean.div(&scale)
+    }
+}
+
+/// `β·previous + (1-β)·value`, starting from zero on the first step.
+fn blend(previous: Option<&Tensor>, value: &Tensor, beta: f32) -> Tensor {
+    let fresh = value.mul_scalar(1.0 - beta);
+    match previous {
+        Some(previous) => previous.mul_scalar(beta).add(&fresh),
+        None => fresh,
+    }
+}
+
+/// Adam: per-parameter step sizes from running gradient moments.
+///
+/// ```
+/// # use fastnn::prelude::*;
+/// # let model = Sequential::new().add(Linear::new(4, 2));
+/// let mut opt = Adam::new(model.parameters(), 1e-3).betas(0.9, 0.95);
+/// ```
+pub struct Adam {
+    params: Vec<Param>,
+    moments: Moments,
+    lr: f32,
+    weight_decay: f32,
+}
+
+impl Adam {
+    pub fn new(params: Vec<Param>, lr: f32) -> Adam {
+        Adam { moments: Moments::new(params.len()), params, lr, weight_decay: 0.0 }
+    }
+
+    /// Decay rates for the first and second moment. Lower `beta2` reacts faster
+    /// to changing gradient scale, which transformers often want.
+    pub fn betas(mut self, beta1: f32, beta2: f32) -> Adam {
+        self.moments.beta1 = beta1;
+        self.moments.beta2 = beta2;
         self
     }
 
-    pub fn epsilon(mut self, eps: f32) -> Self {
-        self.epsilon = eps;
+    /// Floor on the denominator, guarding against division by a tiny variance.
+    pub fn eps(mut self, eps: f32) -> Adam {
+        self.moments.eps = eps;
         self
     }
 
-    pub fn weight_decay(mut self, wd: f32) -> Self {
-        self.weight_decay = wd;
+    /// L2 penalty folded into the gradient. For true weight decay use [`AdamW`].
+    pub fn weight_decay(mut self, decay: f32) -> Adam {
+        self.weight_decay = decay;
         self
     }
 }
 
 impl Optimizer for Adam {
-    fn step(&mut self, params: &mut [&mut Tensor]) {
-        if !self.initialized {
-            self.m = params.iter().map(|p| vec![0.0f32; p.numel()]).collect();
-            self.v = params.iter().map(|p| vec![0.0f32; p.numel()]).collect();
-            self.initialized = true;
-        }
+    fn step(&mut self) {
+        self.moments.steps += 1;
+        for (index, param) in self.params.iter().enumerate() {
+            let Some(grad) = param.grad() else { continue };
+            let value = param.value();
 
-        self.step_count += 1;
-        let t = self.step_count as f32;
-        let bc1 = 1.0 - self.beta1.powf(t);
-        let bc2 = 1.0 - self.beta2.powf(t);
-
-        for (i, param) in params.iter_mut().enumerate() {
-            let grad = match param.grad() {
-                Some(g) => g,
-                None => continue,
+            let grad = if self.weight_decay == 0.0 {
+                grad
+            } else {
+                grad.add(&value.mul_scalar(self.weight_decay))
             };
 
-            let mut param_data = param.to_vec();
-            let grad_data = grad.to_vec();
-            let m_data = &mut self.m[i];
-            let v_data = &mut self.v[i];
-
-            for j in 0..param_data.len() {
-                let g = if self.weight_decay != 0.0 {
-                    grad_data[j] + self.weight_decay * param_data[j]
-                } else {
-                    grad_data[j]
-                };
-                m_data[j] = self.beta1 * m_data[j] + (1.0 - self.beta1) * g;
-                v_data[j] = self.beta2 * v_data[j] + (1.0 - self.beta2) * g * g;
-                let m_hat = m_data[j] / bc1;
-                let v_hat = v_data[j] / bc2;
-                param_data[j] -= self.lr * m_hat / (v_hat.sqrt() + self.epsilon);
-            }
-
-            param.set_data_from_vec(param_data);
+            let update = self.moments.update(index, &grad);
+            param.set_value(value.sub(&update.mul_scalar(self.lr)));
         }
     }
 
-    fn get_lr(&self) -> f32 { self.lr }
-    fn set_lr(&mut self, lr: f32) { self.lr = lr; }
+    fn parameters(&self) -> &[Param] {
+        &self.params
+    }
+
+    fn lr(&self) -> f32 {
+        self.lr
+    }
+
+    fn set_lr(&mut self, lr: f32) {
+        self.lr = lr;
+    }
 }
 
-/// AdamW optimizer (decoupled weight decay).
+/// Adam with decoupled weight decay.
+///
+/// Adam's L2 penalty goes through the moment estimates, so a parameter with
+/// consistently small gradients gets decayed *harder* than one with large ones —
+/// the opposite of the intent. AdamW shrinks the weight directly instead, which
+/// is why it is the default for transformers.
 pub struct AdamW {
+    params: Vec<Param>,
+    moments: Moments,
     lr: f32,
-    beta1: f32,
-    beta2: f32,
-    epsilon: f32,
     weight_decay: f32,
-    step_count: usize,
-    m: Vec<Vec<f32>>,
-    v: Vec<Vec<f32>>,
-    initialized: bool,
 }
 
 impl AdamW {
-    pub fn new(lr: f32) -> Self {
-        AdamW {
-            lr,
-            beta1: 0.9,
-            beta2: 0.999,
-            epsilon: 1e-8,
-            weight_decay: 0.01,
-            step_count: 0,
-            m: Vec::new(),
-            v: Vec::new(),
-            initialized: false,
-        }
+    pub fn new(params: Vec<Param>, lr: f32) -> AdamW {
+        AdamW { moments: Moments::new(params.len()), params, lr, weight_decay: 0.01 }
     }
 
-    pub fn betas(mut self, beta1: f32, beta2: f32) -> Self {
-        self.beta1 = beta1;
-        self.beta2 = beta2;
+    pub fn betas(mut self, beta1: f32, beta2: f32) -> AdamW {
+        self.moments.beta1 = beta1;
+        self.moments.beta2 = beta2;
         self
     }
 
-    pub fn weight_decay(mut self, wd: f32) -> Self {
-        self.weight_decay = wd;
+    pub fn eps(mut self, eps: f32) -> AdamW {
+        self.moments.eps = eps;
+        self
+    }
+
+    pub fn weight_decay(mut self, decay: f32) -> AdamW {
+        self.weight_decay = decay;
         self
     }
 }
 
 impl Optimizer for AdamW {
-    fn step(&mut self, params: &mut [&mut Tensor]) {
-        if !self.initialized {
-            self.m = params.iter().map(|p| vec![0.0f32; p.numel()]).collect();
-            self.v = params.iter().map(|p| vec![0.0f32; p.numel()]).collect();
-            self.initialized = true;
-        }
+    fn step(&mut self) {
+        self.moments.steps += 1;
+        for (index, param) in self.params.iter().enumerate() {
+            let Some(grad) = param.grad() else { continue };
 
-        self.step_count += 1;
-        let t = self.step_count as f32;
-        let bc1 = 1.0 - self.beta1.powf(t);
-        let bc2 = 1.0 - self.beta2.powf(t);
-
-        for (i, param) in params.iter_mut().enumerate() {
-            let grad = match param.grad() {
-                Some(g) => g,
-                None => continue,
-            };
-            let mut param_data = param.to_vec();
-            let grad_data = grad.to_vec();
-            let m_data = &mut self.m[i];
-            let v_data = &mut self.v[i];
-
-            for j in 0..param_data.len() {
-                // Decoupled weight decay applied directly to params.
-                param_data[j] -= self.lr * self.weight_decay * param_data[j];
-
-                let g = grad_data[j];
-                m_data[j] = self.beta1 * m_data[j] + (1.0 - self.beta1) * g;
-                v_data[j] = self.beta2 * v_data[j] + (1.0 - self.beta2) * g * g;
-                let m_hat = m_data[j] / bc1;
-                let v_hat = v_data[j] / bc2;
-                param_data[j] -= self.lr * m_hat / (v_hat.sqrt() + self.epsilon);
-            }
-
-            param.set_data_from_vec(param_data);
+            // Shrink the weight first, untouched by the moment estimates.
+            let value = param.value().mul_scalar(1.0 - self.lr * self.weight_decay);
+            let update = self.moments.update(index, &grad);
+            param.set_value(value.sub(&update.mul_scalar(self.lr)));
         }
     }
 
-    fn get_lr(&self) -> f32 { self.lr }
-    fn set_lr(&mut self, lr: f32) { self.lr = lr; }
+    fn parameters(&self) -> &[Param] {
+        &self.params
+    }
+
+    fn lr(&self) -> f32 {
+        self.lr
+    }
+
+    fn set_lr(&mut self, lr: f32) {
+        self.lr = lr;
+    }
 }
