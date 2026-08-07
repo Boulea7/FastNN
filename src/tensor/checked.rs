@@ -28,13 +28,16 @@ impl Tensor {
     /// [`matmul`](Tensor::matmul), reporting a mismatch instead of panicking.
     pub fn try_matmul(&self, other: &Tensor) -> Result<Tensor> {
         self.check_same_device(other, "matmul")?;
-        self.check_matmul_dims(other, self.last_dim(), other.dim_or_err(other.ndim() - 2)?)?;
+        // Rank first: `ndim() - 2` underflows on a 1-D operand.
+        self.check_matmul_rank(other)?;
+        self.check_matmul_dims(other, self.last_dim(), other.dim(other.ndim() - 2))?;
         Ok(self.matmul(other))
     }
 
     /// [`matmul_nt`](Tensor::matmul_nt), reporting a mismatch instead of panicking.
     pub fn try_matmul_nt(&self, other: &Tensor) -> Result<Tensor> {
         self.check_same_device(other, "matmul_nt")?;
+        self.check_matmul_rank(other)?;
         self.check_matmul_dims(other, self.last_dim(), other.last_dim())?;
         Ok(self.matmul_nt(other))
     }
@@ -42,8 +45,8 @@ impl Tensor {
     /// [`matmul_tn`](Tensor::matmul_tn), reporting a mismatch instead of panicking.
     pub fn try_matmul_tn(&self, other: &Tensor) -> Result<Tensor> {
         self.check_same_device(other, "matmul_tn")?;
-        let inner = self.dim_or_err(self.ndim().saturating_sub(2))?;
-        self.check_matmul_dims(other, inner, other.dim_or_err(other.ndim() - 2)?)?;
+        self.check_matmul_rank(other)?;
+        self.check_matmul_dims(other, self.dim(self.ndim() - 2), other.dim(other.ndim() - 2))?;
         Ok(self.matmul_tn(other))
     }
 
@@ -120,13 +123,18 @@ impl Tensor {
         Ok(())
     }
 
-    /// Both operands need rank 2+, matching inner dimensions, and compatible batches.
-    fn check_matmul_dims(&self, other: &Tensor, inner: usize, other_inner: usize) -> Result<()> {
+    /// Matmul needs rank 2+ on both sides before any inner axis even exists.
+    fn check_matmul_rank(&self, other: &Tensor) -> Result<()> {
         if self.ndim() < 2 || other.ndim() < 2 {
             return Err(Error::Shape(format!(
                 "matmul: needs 2+ dimensions, got {:?} and {:?}", self.shape(), other.shape()
             )));
         }
+        Ok(())
+    }
+
+    /// Matching inner dimensions and compatible batches; rank is already checked.
+    fn check_matmul_dims(&self, other: &Tensor, inner: usize, other_inner: usize) -> Result<()> {
         if inner != other_inner {
             return Err(Error::Shape(format!(
                 "matmul: inner dimensions {inner} and {other_inner} disagree for {:?} and {:?}",
@@ -158,12 +166,6 @@ impl Tensor {
         Ok(())
     }
 
-    fn dim_or_err(&self, axis: usize) -> Result<usize> {
-        self.shape()
-            .get(axis)
-            .copied()
-            .ok_or_else(|| Error::Shape(format!("axis {axis} out of range for {:?}", self.shape())))
-    }
 }
 
 #[cfg(test)]
@@ -176,6 +178,9 @@ mod tests {
         assert!(x.try_matmul(&Tensor::zeros(&[8, 2])).is_ok());
         assert!(x.try_matmul(&Tensor::zeros(&[3, 3])).is_err());
         assert!(x.try_matmul(&Tensor::zeros(&[8])).is_err());
+        assert!(Tensor::zeros(&[8]).try_matmul(&x).is_err());
+        assert!(x.try_matmul_tn(&Tensor::zeros(&[4])).is_err());
+        assert!(x.try_matmul_nt(&Tensor::zeros(&[8])).is_err());
     }
 
     #[test]
