@@ -99,9 +99,10 @@ pub mod prelude {
     pub use crate::data::{Batch, DataLoader, Dataset, TensorDataset};
     pub use crate::nn::{
         bce, bce_with_logits, cross_entropy, mae, mse, AdaptiveAvgPool2d, AvgPool2d, BatchNorm2d,
-        Buffer, Conv2d, Dropout, Embedding, Flatten, LayerNorm, LeakyReLU, Linear, MaxPool2d,
-        Module, MultiHeadAttention, Param, PositionalEncoding, RMSNorm, ReLU, Reshape, Sequential,
-        Sigmoid, SiLU, Softmax, Tanh, TransformerBlock, TransformerStack, GELU, GRU, LSTM,
+        Buffer, Conv2d, Dropout, Embedding, Flatten, KvCache, LayerNorm, LeakyReLU, Linear,
+        MaxPool2d, Module, MultiHeadAttention, Param, PositionalEncoding, RMSNorm, ReLU, Reshape,
+        Sampler, Sequential, Sigmoid, SiLU, Softmax, StackCache, Tanh, TransformerBlock,
+        TransformerStack, GELU, GRU, LSTM,
     };
     pub use crate::optim::{
         clip_grad_norm, Adam, AdamW, Constant, CosineAnnealing, LrSchedule, OneCycle, Optimizer,

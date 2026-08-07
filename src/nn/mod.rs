@@ -30,6 +30,7 @@
 
 pub mod activation;
 pub mod attention;
+pub mod cache;
 pub mod conv;
 pub mod dropout;
 pub mod embedding;
@@ -40,12 +41,14 @@ pub mod norm;
 pub mod param;
 pub mod pooling;
 pub mod rnn;
+pub mod sample;
 pub mod sequential;
 pub mod shape;
 pub mod transformer;
 
 pub use activation::{LeakyReLU, ReLU, Sigmoid, SiLU, Softmax, Tanh, GELU};
 pub use attention::MultiHeadAttention;
+pub use cache::{KvCache, StackCache};
 pub use conv::Conv2d;
 pub use dropout::Dropout;
 pub use embedding::{Embedding, PositionalEncoding};
@@ -56,6 +59,7 @@ pub use norm::{BatchNorm2d, LayerNorm, RMSNorm};
 pub use param::{Buffer, Param};
 pub use pooling::{AdaptiveAvgPool2d, AvgPool2d, MaxPool2d};
 pub use rnn::{GRU, LSTM};
+pub use sample::Sampler;
 pub use sequential::Sequential;
 pub use shape::{Flatten, Reshape};
 pub use transformer::{Activation, TransformerBlock, TransformerStack};
