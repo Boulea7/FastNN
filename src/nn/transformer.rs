@@ -3,6 +3,7 @@
 use crate::tensor::Tensor;
 
 use super::attention::MultiHeadAttention;
+use super::cache::{KvCache, StackCache};
 use super::dropout::Dropout;
 use super::linear::Linear;
 use super::module::{scoped, Module};
@@ -72,6 +73,22 @@ impl TransformerBlock {
             causal,
         }
     }
+
+    /// [`forward`](Module::forward) with the attention keys and values cached
+    /// for incremental decoding.
+    ///
+    /// Inference-only — dropout is skipped — and causal by nature: a cache only
+    /// makes sense when later tokens cannot change earlier ones.
+    pub fn forward_cached(&self, input: &Tensor, cache: &mut KvCache) -> Tensor {
+        assert!(self.causal, "kv-cached decoding needs a causal block; this one is an encoder");
+
+        let normed = self.norm_attention.forward(input);
+        let residual = input.add(&self.attention.attend_cached(&normed, cache));
+
+        let normed = self.norm_feedforward.forward(&residual);
+        let hidden = self.activation.apply(&self.up.forward(&normed));
+        residual.add(&self.down.forward(&hidden))
+    }
 }
 
 impl Module for TransformerBlock {
@@ -126,6 +143,29 @@ impl TransformerStack {
             blocks: (0..layers).map(|_| block()).collect(),
             norm: LayerNorm::new(model_dim),
         }
+    }
+
+    /// A cache sized for this stack, ready for [`forward_cached`](Self::forward_cached).
+    pub fn new_cache(&self) -> StackCache {
+        StackCache::new(self.blocks.len())
+    }
+
+    /// [`forward`](Module::forward) through per-block KV caches, for feeding a
+    /// generation loop one token at a time. See [`super::cache`].
+    pub fn forward_cached(&self, input: &Tensor, cache: &mut StackCache) -> Tensor {
+        assert_eq!(
+            cache.layers.len(),
+            self.blocks.len(),
+            "cache has {} layers but the stack has {} blocks",
+            cache.layers.len(),
+            self.blocks.len()
+        );
+        let hidden = self
+            .blocks
+            .iter()
+            .zip(&mut cache.layers)
+            .fold(input.clone(), |x, (block, layer)| block.forward_cached(&x, layer));
+        self.norm.forward(&hidden)
     }
 }
 
