@@ -1,6 +1,6 @@
 //! A character-level language model: a small GPT trained from scratch.
 //!
-//!     cargo run --example char_lm --no-default-features --release
+//!     cargo run --example char_lm --release
 //!     cargo run --example char_lm --release -- corpus.txt
 //!
 //! With no argument it trains on a short embedded excerpt, which is enough to

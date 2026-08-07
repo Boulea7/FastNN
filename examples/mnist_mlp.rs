@@ -1,6 +1,7 @@
 //! MNIST with a two-layer MLP. Downloads the dataset on first run.
 //!
-//!     cargo run --example mnist_mlp --no-default-features --release
+//!     cargo run --example mnist_mlp --release
+//!     cargo run --example mnist_mlp --release --features cuda
 //!
 //! Reaches roughly 97% test accuracy in three epochs.
 

@@ -6,8 +6,8 @@ on:
   pull_request:
 
 jobs:
-  # CPU-only build plus the full finite-difference gradient-check suite.
-  # GitHub runners have no CUDA toolkit, so this exercises the CPU maths; the
+  # The default build is CPU-only, so runners need no CUDA toolkit; the full
+  # finite-difference gradient-check suite exercises the CPU maths, and the
   # kernels are checked against it locally by tests/cuda_parity.rs.
   cpu:
     runs-on: ubuntu-latest
@@ -29,16 +29,19 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Build (CPU-only)
-        run: cargo build --no-default-features --all-targets
+        run: cargo build --all-targets
 
       - name: Gradient checks (finite difference)
-        run: cargo test --no-default-features --test gradcheck -- --nocapture
+        run: cargo test --test gradcheck -- --nocapture
 
       - name: Robustness (resume, anomalies, freezing)
-        run: cargo test --no-default-features --test robustness
+        run: cargo test --test robustness
+
+      - name: Generation (kv cache, sampling)
+        run: cargo test --test generation
 
       - name: Unit + integration tests
-        run: cargo test --no-default-features
+        run: cargo test
 
       - name: Clippy
-        run: cargo clippy --no-default-features --all-targets -- -D warnings
+        run: cargo clippy --all-targets -- -D warnings

@@ -1,7 +1,7 @@
 //! Throughput benchmarks for the hot paths.
 //!
-//!     cargo bench --no-default-features   # CPU
-//!     cargo bench                         # CUDA, if the toolkit is present
+//!     cargo bench                         # CPU
+//!     cargo bench --features cuda         # CUDA, if the toolkit is present
 //!
 //! Benchmarks run on whichever device is available, so the same command measures
 //! either backend. GPU timings include the launch, not just the kernel.

@@ -1,6 +1,7 @@
 //! MNIST with a small convolutional network.
 //!
-//!     cargo run --example mnist_cnn --no-default-features --release
+//!     cargo run --example mnist_cnn --release
+//!     cargo run --example mnist_cnn --release --features cuda
 //!
 //! Two conv blocks (convolution, batch norm, ReLU, max pool) then a linear head.
 //! Slower per step than the MLP but reaches ~99% test accuracy, because the

@@ -1,6 +1,6 @@
 //! The smallest complete training loop: an MLP learning XOR.
 //!
-//!     cargo run --example simple_mlp --no-default-features --release
+//!     cargo run --example simple_mlp --release
 //!
 //! XOR is not linearly separable, so a single linear layer cannot fit it at all.
 //! Two layers with a non-linearity between them can, which makes this the

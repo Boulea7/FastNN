@@ -37,10 +37,10 @@ fn build_cuda() {
     };
 
     // Compile CUDA kernels using cc with nvcc
-    cc::Build::new()
+    let mut build = cc::Build::new();
+    build
         .cuda(true)
         .cudart("shared")
-        .flag("-ccbin=g++-15") // GCC 16 is not yet supported by nvcc
         .flag("-gencode=arch=compute_75,code=sm_75") // Turing
         .flag("-gencode=arch=compute_80,code=sm_80") // Ampere
         .flag("-gencode=arch=compute_86,code=sm_86") // Ampere (RTX 30xx)
@@ -51,8 +51,19 @@ fn build_cuda() {
         .flag("-O3")
         .include("cuda/include")
         .include(&cuda_include)
-        .file("cuda/kernels.cu")
-        .compile("fastnn_cuda_kernels");
+        .file("cuda/kernels.cu");
+
+    // nvcc rejects host compilers newer than it knows. FASTNN_NVCC_CCBIN picks
+    // one explicitly; otherwise fall back to g++-15 when the system g++ is too
+    // new and g++-15 is around.
+    println!("cargo:rerun-if-env-changed=FASTNN_NVCC_CCBIN");
+    if let Ok(ccbin) = env::var("FASTNN_NVCC_CCBIN") {
+        build.flag(&format!("-ccbin={ccbin}"));
+    } else if std::process::Command::new("g++-15").arg("--version").output().is_ok() {
+        build.flag("-ccbin=g++-15");
+    }
+
+    build.compile("fastnn_cuda_kernels");
 
     // Link CUDA runtime and libraries
     println!("cargo:rustc-link-search=native={}", cuda_lib.display());

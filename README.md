@@ -36,12 +36,21 @@ training loop.
 
 ## Getting started
 
+As a dependency:
+
+```bash
+cargo add fastnn                   # CPU only — no CUDA toolkit needed
+cargo add fastnn --features cuda   # with the CUDA kernels
+```
+
+Running the examples from a checkout:
+
 ```bash
 # CPU only — no CUDA toolkit needed
-cargo run --example simple_mlp --no-default-features --release
+cargo run --example simple_mlp --release
 
 # With a GPU
-cargo run --example mnist_mlp --release
+cargo run --example mnist_mlp --release --features cuda
 ```
 
 Always use `--release`. Debug builds are roughly 50× slower.
@@ -265,11 +274,12 @@ load(&model, "model.fdl")?;          // missing file, or a shape that moved
 ## Testing
 
 ```bash
-cargo test --no-default-features --test gradcheck   # every backward rule
-cargo test --no-default-features --test robustness  # resume, anomalies, freezing
-cargo test --test cuda_parity -- --test-threads=1   # CPU vs GPU
-cargo test --no-default-features                    # everything
-cargo bench --no-default-features                   # throughput
+cargo test --test gradcheck    # every backward rule
+cargo test --test robustness   # resume, anomalies, freezing
+cargo test --test generation   # kv-cached decoding, sampling
+cargo test --features cuda --test cuda_parity -- --test-threads=1   # CPU vs GPU
+cargo test                     # everything
+cargo bench                    # throughput
 ```
 
 `gradcheck` checks every backward rule against central finite differences of its
@@ -284,13 +294,15 @@ which included MNIST's ten classes and any odd sequence length.
 
 ## CUDA
 
-Needs the NVIDIA CUDA Toolkit; set `CUDA_PATH` or `CUDA_HOME` if it is not in the
-default location. `build.rs` compiles `cuda/kernels.cu` with `nvcc` and links
-`cudart`, `cublas`, and `curand`. Compute capabilities 7.5 through 9.0 (Turing
-through Hopper).
+The `cuda` feature is opt-in, so a plain `cargo add fastnn` never needs the
+toolkit. Enabling it needs the NVIDIA CUDA Toolkit; set `CUDA_PATH` or
+`CUDA_HOME` if it is not in the default location. `build.rs` compiles
+`cuda/kernels.cu` with `nvcc` and links `cudart`, `cublas`, and `curand`.
+Compute capabilities 7.5 through 9.0 (Turing through Hopper). If `nvcc` rejects
+your system compiler as too new, point `FASTNN_NVCC_CCBIN` at one it accepts.
 
-`--no-default-features` skips all of that: `cuda/stubs.c` supplies the symbols,
-`Device::cuda(0)` returns an error, and everything runs on the CPU.
+Without the feature, `cuda/stubs.c` supplies the symbols, `Device::cuda(0)`
+returns an error, and everything runs on the CPU.
 
 Two things carry most of the GPU performance. Matrix multiplication goes through
 cuBLAS, and the two transposed forms the backward pass needs (`matmul_nt`,

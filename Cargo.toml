@@ -1,12 +1,15 @@
 [package]
 name = "fastnn"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
+rust-version = "1.87"
 description = "A deep learning library in Rust, with CUDA kernels for the parts that matter"
 license = "MIT"
 readme = "README.md"
+repository = "https://github.com/CanReader/FastNN"
 keywords = ["deep-learning", "neural-network", "cuda", "gpu", "machine-learning"]
 categories = ["science", "mathematics"]
+exclude = ["docs/", ".github/"]
 
 [lib]
 name = "fastnn"
@@ -27,9 +30,10 @@ cc = { version = "1.0", features = ["parallel"] }
 criterion = { version = "0.5", features = ["html_reports"] }
 
 [features]
-default = ["cuda"]
-# Compile cuda/kernels.cu with nvcc and link cudart/cublas/curand.
-# Without it, cuda/stubs.c supplies the symbols and everything runs on the CPU.
+default = []
+# Compile cuda/kernels.cu with nvcc and link cudart/cublas/curand. Off by
+# default so `cargo add fastnn` builds without the CUDA toolkit; without it,
+# cuda/stubs.c supplies the symbols and everything runs on the CPU.
 cuda = []
 
 [[example]]
