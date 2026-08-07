@@ -165,8 +165,16 @@ fn cuda_gemm(
     result.expect("cuda gemm")
 }
 
-/// Row-parallel GEMM. The `i,p,j` loop order streams `b` contiguously in the
-/// innermost loop, which is what keeps the CPU path cache-friendly.
+/// Row-parallel GEMM.
+///
+/// Parallelism is per *output row*, not per batch: a transformer step's largest
+/// multiplies — the feed-forward and head projections — have batch 1, and
+/// batch-level chunks would leave every core but one idle on exactly the work
+/// that dominates.
+///
+/// Each layout gets the loop order that streams its operands contiguously:
+/// `Plain` and `LhsT` accumulate whole rows of `b` at a time, and `RhsT` — the
+/// `q·kᵀ` of every attention score — is a dot product of two contiguous rows.
 fn cpu_gemm(a: &[f32], b: &[f32], dims: &Dims, layout: Layout) -> Vec<f32> {
     let Dims { m, n, k, batch, a_batch, b_batch } = *dims;
     let (a_stride, b_stride) = (
@@ -174,35 +182,40 @@ fn cpu_gemm(a: &[f32], b: &[f32], dims: &Dims, layout: Layout) -> Vec<f32> {
         if b_batch == 1 { 0 } else { k * n },
     );
 
-    let mut out = vec![0.0f32; batch * m * n];
-    out.par_chunks_mut(m * n).enumerate().for_each(|(batch_index, tile)| {
+    let fill_row = |row_index: usize, row: &mut [f32]| {
+        let (batch_index, i) = (row_index / m, row_index % m);
         let a_base = batch_index * a_stride;
         let b_base = batch_index * b_stride;
-        for i in 0..m {
-            for p in 0..k {
-                let lhs = match layout {
-                    Layout::LhsT => a[a_base + p * m + i],
-                    _ => a[a_base + i * k + p],
-                };
-                if lhs == 0.0 {
-                    continue;
-                }
-                let row = &mut tile[i * n..(i + 1) * n];
-                match layout {
-                    Layout::RhsT => {
-                        for (j, cell) in row.iter_mut().enumerate() {
-                            *cell += lhs * b[b_base + j * k + p];
-                        }
-                    }
-                    _ => {
-                        let b_row = &b[b_base + p * n..b_base + (p + 1) * n];
-                        for (cell, &rhs) in row.iter_mut().zip(b_row) {
-                            *cell += lhs * rhs;
-                        }
-                    }
-                }
+
+        if layout == Layout::RhsT {
+            let a_row = &a[a_base + i * k..a_base + (i + 1) * k];
+            for (j, cell) in row.iter_mut().enumerate() {
+                let b_row = &b[b_base + j * k..b_base + (j + 1) * k];
+                *cell = a_row.iter().zip(b_row).map(|(&x, &y)| x * y).sum();
+            }
+            return;
+        }
+        for p in 0..k {
+            let lhs = match layout {
+                Layout::LhsT => a[a_base + p * m + i],
+                _ => a[a_base + i * k + p],
+            };
+            if lhs == 0.0 {
+                continue;
+            }
+            let b_row = &b[b_base + p * n..b_base + (p + 1) * n];
+            for (cell, &rhs) in row.iter_mut().zip(b_row) {
+                *cell += lhs * rhs;
             }
         }
-    });
+    };
+
+    let mut out = vec![0.0f32; batch * m * n];
+    // Tiny multiplies are not worth a trip through the thread pool.
+    if batch * m * n * k < 16_384 {
+        out.chunks_mut(n).enumerate().for_each(|(r, row)| fill_row(r, row));
+    } else {
+        out.par_chunks_mut(n).enumerate().for_each(|(r, row)| fill_row(r, row));
+    }
     out
 }
