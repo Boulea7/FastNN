@@ -1,16 +1,21 @@
-//! Derivative of `im2col`.
+//! Derivatives of the `im2col` / `col2im` adjoint pair.
+//!
+//! The two operations are transposes of one linear map, so each is the
+//! other's gradient: differentiating the unfold means folding the incoming
+//! gradient, and differentiating the fold means unfolding it. Both rules
+//! delegate to the same shared index maps the forwards use — the adjoint
+//! identity holds by construction, not by keeping two loops in sync.
 
 use crate::autograd::Backward;
 use crate::cuda::kernels;
-use crate::tensor::ops::conv::Window;
+use crate::tensor::ops::conv::{fold, unfold, Window};
 use crate::tensor::storage::Storage;
 use crate::tensor::Tensor;
 
-/// Fold columns back into an image, adding where windows overlapped.
-///
-/// A pixel covered by several windows was copied into several columns, so its
-/// gradient is the sum of theirs. Pixels that only ever landed in padding get
-/// nothing.
+/// Gradient of `im2col`: fold columns back into the image, adding where
+/// windows overlapped. A pixel covered by several windows was copied into
+/// several columns, so its gradient is the sum of theirs; pixels that only
+/// ever landed in padding get nothing.
 pub struct Col2ImBackward {
     pub shape: Vec<usize>,
     pub window: Window,
@@ -19,51 +24,52 @@ pub struct Col2ImBackward {
 impl Backward for Col2ImBackward {
     fn backward(&self, grad: &Tensor) -> Vec<Tensor> {
         let (n, c, h, w) = (self.shape[0], self.shape[1], self.shape[2], self.shape[3]);
-        let (kh, kw) = self.window.kernel;
-        let (sh, sw) = self.window.stride;
-        let (ph, pw) = self.window.padding;
         let (out_h, out_w) = self.window.output_size(h, w);
-        let (patch, positions) = (c * kh * kw, out_h * out_w);
 
         if let Storage::Cuda(buf) = grad.storage() {
             let image = kernels::col2im(
                 buf, (n, c, h, w), self.window.kernel, self.window.stride, self.window.padding,
-                (out_h, out_w),
+                self.window.dilation, (out_h, out_w),
             )
             .expect("cuda col2im");
             return vec![Tensor::raw(Storage::Cuda(image), self.shape.clone(), grad.device())];
         }
 
-        let cols = grad.to_vec();
-        let mut image = vec![0.0f32; n * c * h * w];
-
-        for index in 0..n {
-            for channel in 0..c {
-                for ki in 0..kh {
-                    for kj in 0..kw {
-                        let row = (channel * kh + ki) * kw + kj;
-                        let src_base = (index * patch + row) * positions;
-                        let dst_base = (index * c + channel) * h * w;
-                        for oh in 0..out_h {
-                            let Some(ih) = source(oh, ki, sh, ph, h) else { continue };
-                            for ow in 0..out_w {
-                                let Some(iw) = source(ow, kj, sw, pw, w) else { continue };
-                                image[dst_base + ih * w + iw] += cols[src_base + oh * out_w + ow];
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        vec![Tensor::from_vec(image, &self.shape).to(grad.device())]
+        vec![Tensor::from_vec(fold(&grad.to_vec(), &self.shape, self.window), &self.shape)]
     }
     fn name(&self) -> &'static str {
         "Col2Im"
     }
 }
 
-fn source(out: usize, k: usize, stride: usize, pad: usize, limit: usize) -> Option<usize> {
-    let pos = (out * stride + k) as isize - pad as isize;
-    (pos >= 0 && (pos as usize) < limit).then_some(pos as usize)
+/// Gradient of `col2im`: unfold the incoming image gradient back into columns.
+///
+/// Each column entry contributed to exactly one pixel, so its gradient is that
+/// pixel's — which is precisely what `im2col` reads.
+pub struct Im2ColBackward {
+    pub window: Window,
+}
+
+impl Backward for Im2ColBackward {
+    fn backward(&self, grad: &Tensor) -> Vec<Tensor> {
+        let shape = grad.shape().to_vec();
+        let (n, c, h, w) = (shape[0], shape[1], shape[2], shape[3]);
+        let (kh, kw) = self.window.kernel;
+        let (out_h, out_w) = self.window.output_size(h, w);
+        let cols_shape = [n, c * kh * kw, out_h * out_w];
+
+        if let Storage::Cuda(buf) = grad.storage() {
+            let cols = kernels::im2col(
+                buf, (n, c, h, w), self.window.kernel, self.window.stride, self.window.padding,
+                self.window.dilation, (out_h, out_w),
+            )
+            .expect("cuda im2col");
+            return vec![Tensor::raw(Storage::Cuda(cols), cols_shape.to_vec(), grad.device())];
+        }
+
+        vec![Tensor::from_vec(unfold(&grad.to_vec(), &shape, self.window), &cols_shape)]
+    }
+    fn name(&self) -> &'static str {
+        "Im2Col"
+    }
 }

@@ -279,6 +279,7 @@ pub fn im2col(
     (kh, kw): (usize, usize),
     (sh, sw): (usize, usize),
     (ph, pw): (usize, usize),
+    (dh, dw): (usize, usize),
     (out_h, out_w): (usize, usize),
 ) -> Result<CudaBuffer> {
     launch(n * c * kh * kw * out_h * out_w, "im2col", |out| unsafe {
@@ -286,7 +287,7 @@ pub fn im2col(
             input.as_ptr(), out.as_mut_ptr(),
             n as c_int, c as c_int, h as c_int, w as c_int,
             kh as c_int, kw as c_int, sh as c_int, sw as c_int, ph as c_int, pw as c_int,
-            out_h as c_int, out_w as c_int,
+            dh as c_int, dw as c_int, out_h as c_int, out_w as c_int,
         )
     })
 }
@@ -298,6 +299,7 @@ pub fn col2im(
     (kh, kw): (usize, usize),
     (sh, sw): (usize, usize),
     (ph, pw): (usize, usize),
+    (dh, dw): (usize, usize),
     (out_h, out_w): (usize, usize),
 ) -> Result<CudaBuffer> {
     launch(n * c * h * w, "col2im", |out| unsafe {
@@ -305,7 +307,7 @@ pub fn col2im(
             cols.as_ptr(), out.as_mut_ptr(),
             n as c_int, c as c_int, h as c_int, w as c_int,
             kh as c_int, kw as c_int, sh as c_int, sw as c_int, ph as c_int, pw as c_int,
-            out_h as c_int, out_w as c_int,
+            dh as c_int, dw as c_int, out_h as c_int, out_w as c_int,
         )
     })
 }

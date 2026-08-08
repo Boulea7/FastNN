@@ -486,3 +486,31 @@ fn per_row_cross_entropy_matches_finite_differences() {
         loss_fn.compute(&v[0], &[0, 3, 1]).mul(&weight).sum()
     });
 }
+
+/// col2im is a new forward op; check it (and its Im2ColBackward) directly,
+/// weighted so overlap accumulation cannot hide behind a symmetric sum.
+#[test]
+fn col2im_matches_finite_differences() {
+    use fastnn::tensor::Window;
+    let window = Window::square(2, 2, 0);
+    // Columns for a 4×4 target image: patch = 1·2·2, positions = 2·2.
+    let weight = sample(&[1, 1, 4, 4]);
+
+    gradcheck("col2im", &[sample(&[1, 4, 4])], |v| {
+        v[0].col2im(window, (4, 4)).mul(&weight).sum()
+    });
+}
+
+/// Dilation changes the index map; the finite-difference check proves the
+/// backward folds along the same stretched footprint the forward reads.
+#[test]
+fn dilated_im2col_matches_finite_differences() {
+    use fastnn::tensor::Window;
+    // Span (2−1)·2+1 = 3 on a padded 5×5 input → 5×5 = 25 output positions.
+    let window = Window::square(2, 1, 1).dilated(2);
+    let weight = sample(&[1, 4, 25]);
+
+    gradcheck("dilated im2col", &[sample(&[1, 1, 5, 5])], |v| {
+        v[0].im2col(window).mul(&weight).sum()
+    });
+}

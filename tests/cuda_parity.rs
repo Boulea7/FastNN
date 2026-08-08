@@ -362,3 +362,16 @@ fn convolution_lowering() {
         cols.mul(&weight).sum()
     });
 }
+
+#[test]
+fn dilated_convolution_lowering() {
+    let x = sample(&[1, 2, 6, 6]);
+    let window = Window::square(2, 1, 1).dilated(2);
+
+    check_forward("dilated im2col", &[x.clone()], |v| v[0].im2col(window));
+    check_backward("dilated col2im op", &[sample(&[1, 8, 4])], |v| {
+        let folded = v[0].col2im(Window::square(2, 2, 0), (4, 4));
+        let weight = Tensor::from_vec(spread(folded.numel(), -0.9, 0.9), folded.shape()).to(folded.device());
+        folded.mul(&weight).sum()
+    });
+}

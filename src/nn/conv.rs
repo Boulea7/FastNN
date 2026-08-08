@@ -17,6 +17,7 @@ pub struct Conv2d {
     window: Window,
     in_channels: usize,
     out_channels: usize,
+    groups: usize,
 }
 
 impl Conv2d {
@@ -33,10 +34,44 @@ impl Conv2d {
 
     /// Full control over the window and whether there is a bias.
     pub fn with_window(in_channels: usize, out_channels: usize, window: Window, bias: bool) -> Conv2d {
+        Conv2d::build(in_channels, out_channels, window, bias, 1)
+    }
+
+    /// Split the channels into `groups` independent convolutions.
+    ///
+    /// Each group sees only `in/groups` input channels and produces
+    /// `out/groups` outputs, cutting parameters and compute by the group
+    /// count. The weight is `[out, in/groups, kh, kw]`.
+    pub fn grouped(
+        in_channels: usize,
+        out_channels: usize,
+        kernel: usize,
+        stride: usize,
+        padding: usize,
+        groups: usize,
+    ) -> Conv2d {
+        Conv2d::build(in_channels, out_channels, Window::square(kernel, stride, padding), true, groups)
+    }
+
+    /// One filter per channel — `groups == channels`, the spatial half of a
+    /// depthwise-separable convolution. Follow with a 1×1 [`Conv2d`] to mix
+    /// channels back together.
+    pub fn depthwise(channels: usize, kernel: usize, stride: usize, padding: usize) -> Conv2d {
+        Conv2d::grouped(channels, channels, kernel, stride, padding, channels)
+    }
+
+    fn build(in_channels: usize, out_channels: usize, window: Window, bias: bool, groups: usize) -> Conv2d {
+        assert!(groups >= 1, "groups must be at least 1");
+        assert_eq!(in_channels % groups, 0, "{in_channels} input channels do not split into {groups} groups");
+        assert_eq!(out_channels % groups, 0, "{out_channels} output channels do not split into {groups} groups");
+
         let (kh, kw) = window.kernel;
-        let fan_in = in_channels * kh * kw;
+        let fan_in = (in_channels / groups) * kh * kw;
         Conv2d {
-            weight: Param::new(Tensor::kaiming_uniform(&[out_channels, in_channels, kh, kw], fan_in)),
+            weight: Param::new(Tensor::kaiming_uniform(
+                &[out_channels, in_channels / groups, kh, kw],
+                fan_in,
+            )),
             bias: bias.then(|| {
                 let bound = 1.0 / (fan_in as f32).sqrt();
                 Param::new(Tensor::uniform(&[out_channels], -bound, bound))
@@ -44,6 +79,7 @@ impl Conv2d {
             window,
             in_channels,
             out_channels,
+            groups,
         }
     }
 
@@ -65,10 +101,27 @@ impl Module for Conv2d {
         let (out_h, out_w) = self.window.output_size(height, width);
         let out_c = self.out_channels as i64;
 
-        // [N, C·kh·kw, out_h·out_w] against [out_channels, C·kh·kw].
-        let columns = input.im2col(self.window);
-        let kernels = self.weight.tensor().reshape(&[out_c, -1]);
-        let mut out = kernels.matmul(&columns);
+        // [N, C·kh·kw, out_h·out_w] against [out_channels, C·kh·kw]; with
+        // groups, the same product runs once per channel slice and the results
+        // stack back along the channel axis.
+        let mut out = if self.groups == 1 {
+            let columns = input.im2col(self.window);
+            self.weight.tensor().reshape(&[out_c, -1]).matmul(&columns)
+        } else {
+            let (in_per, out_per) = (self.in_channels / self.groups, self.out_channels / self.groups);
+            let pieces: Vec<Tensor> = (0..self.groups)
+                .map(|group| {
+                    let columns = input.narrow(1, group * in_per, in_per).im2col(self.window);
+                    let kernels = self
+                        .weight
+                        .tensor()
+                        .narrow(0, group * out_per, out_per)
+                        .reshape(&[out_per as i64, -1]);
+                    kernels.matmul(&columns)
+                })
+                .collect();
+            Tensor::cat(&pieces.iter().collect::<Vec<_>>(), 1)
+        };
 
         if let Some(bias) = &self.bias {
             out = out.add(&bias.tensor().reshape(&[1, out_c, 1]));
