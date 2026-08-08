@@ -76,8 +76,11 @@ pub(crate) fn multiply(a: &Tensor, b: &Tensor, layout: Layout) -> Tensor {
     );
 
     let dims = resolve_dims(a, b, layout);
+    // The output's batch prefix comes from whichever side actually has one:
+    // more batch items wins, and at equal counts the higher rank wins, so
+    // [m,k] × [1,k,n] stays 3-D instead of collapsing to a plain matrix.
     let mut out_shape: Vec<usize> = a.shape()[..a.ndim() - 2].to_vec();
-    if dims.b_batch > dims.a_batch {
+    if dims.b_batch > dims.a_batch || (dims.b_batch == dims.a_batch && b.ndim() > a.ndim()) {
         out_shape = b.shape()[..b.ndim() - 2].to_vec();
     }
     out_shape.push(dims.m);
