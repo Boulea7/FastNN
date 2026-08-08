@@ -460,3 +460,29 @@ fn masked_attention_matches_finite_differences() {
             .sum()
     });
 }
+
+/// The configurable cross-entropy has its own fused backward; check it under
+/// every option at once — smoothing, class weights, and an ignored row.
+#[test]
+fn weighted_cross_entropy_matches_finite_differences() {
+    let loss_fn = CrossEntropyLoss::new()
+        .label_smoothing(0.1)
+        .class_weights(vec![1.0, 2.0, 0.5, 1.5])
+        .ignore_index(2);
+
+    gradcheck("cross_entropy_loss", &[sample(&[3, 4])], |v| {
+        loss_fn.compute(&v[0], &[1, 2, 3])
+    });
+}
+
+/// The per-row reduction takes a `[batch]` upstream gradient — the other
+/// branch of the backward rule, checked with a weighted combination.
+#[test]
+fn per_row_cross_entropy_matches_finite_differences() {
+    let weight = Tensor::from_vec(vec![0.7, -0.3, 1.2], &[3]);
+    let loss_fn = CrossEntropyLoss::new().reduction(Reduction::None);
+
+    gradcheck("cross_entropy_rows", &[sample(&[3, 4])], |v| {
+        loss_fn.compute(&v[0], &[0, 3, 1]).mul(&weight).sum()
+    });
+}

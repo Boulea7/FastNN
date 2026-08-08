@@ -98,7 +98,8 @@ pub mod prelude {
     pub use crate::autograd::{detect_anomaly, no_grad};
     pub use crate::data::{Batch, DataLoader, Dataset, TensorDataset};
     pub use crate::nn::{
-        bce, bce_with_logits, cross_entropy, mae, mse, AdaptiveAvgPool2d, AvgPool2d, BatchNorm2d,
+        bce, bce_with_logits, cross_entropy, huber, kl_divergence, mae, mse, nll,
+        AdaptiveAvgPool2d, AvgPool2d, BatchNorm2d, CrossEntropyLoss, Reduction,
         BeamSearch, Buffer, Conv2d, Dropout, Embedding, Flatten, KvCache, LayerNorm, LeakyReLU, Linear,
         MaxPool2d, Module, MultiHeadAttention, Param, PositionalEncoding, RMSNorm, ReLU, Reshape,
         Sampler, Sequential, Sigmoid, SiLU, Softmax, StackCache, Tanh, Transformer,

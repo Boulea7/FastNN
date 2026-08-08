@@ -38,6 +38,7 @@ pub mod dropout;
 pub mod embedding;
 pub mod linear;
 pub mod loss;
+pub mod metric_losses;
 pub mod module;
 pub mod norm;
 pub mod param;
@@ -57,7 +58,11 @@ pub use decoder::{Transformer, TransformerDecoder, TransformerDecoderBlock};
 pub use dropout::Dropout;
 pub use embedding::{Embedding, PositionalEncoding};
 pub use linear::Linear;
-pub use loss::{bce, bce_with_logits, cross_entropy, mae, mse};
+pub use loss::{
+    bce, bce_with_logits, cross_entropy, dice, focal_bce_with_logits, gaussian_nll, huber,
+    kl_divergence, mae, mse, nll, poisson_nll, smooth_l1, CrossEntropyLoss, Reduction,
+};
+pub use metric_losses::{contrastive, cosine_embedding, info_nce, margin_ranking, triplet_margin};
 pub use module::Module;
 pub use norm::{BatchNorm2d, LayerNorm, RMSNorm};
 pub use param::{Buffer, Param};

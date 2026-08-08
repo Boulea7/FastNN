@@ -33,3 +33,33 @@ impl Backward for CrossEntropyBackward {
         "CrossEntropy"
     }
 }
+
+/// Gradient of the configurable cross-entropy.
+///
+/// The forward already computed `w·(p − q)` per row — softmax minus the
+/// (possibly smoothed) target distribution, scaled by that row's class weight,
+/// zero for ignored rows. All that remains is the reduction's scaling: the
+/// weighted-mean denominator for `Mean`, nothing for `Sum`, and a per-row
+/// upstream gradient for `None`.
+pub struct WeightedCrossEntropyBackward {
+    pub difference: Tensor,
+    pub normalizer: f32,
+    pub per_row: bool,
+}
+
+impl Backward for WeightedCrossEntropyBackward {
+    fn backward(&self, grad: &Tensor) -> Vec<Tensor> {
+        let difference = self.difference.to(grad.device());
+        let scaled = if self.per_row {
+            // Upstream is one gradient per row; broadcast it across classes.
+            let rows = grad.numel() as i64;
+            difference.mul(&grad.reshape(&[rows, 1]))
+        } else {
+            difference.mul_scalar(grad.item() / self.normalizer)
+        };
+        vec![scaled]
+    }
+    fn name(&self) -> &'static str {
+        "WeightedCrossEntropy"
+    }
+}
