@@ -113,6 +113,8 @@ pub mod prelude {
         StepDecay, Warmup, SGD,
     };
     pub use crate::rng::manual_seed;
-    pub use crate::serialize::{load, load_training, save, save_training};
+    pub use crate::serialize::{
+        load, load_safetensors, load_training, save, save_safetensors, save_training,
+    };
     pub use crate::tensor::{Device, Tensor, Window};
 }

@@ -1,6 +1,5 @@
 //! Convolution-variant semantics, checked against the definitions.
 
-use fastnn::nn::Param;
 use fastnn::prelude::*;
 use fastnn::tensor::Window;
 

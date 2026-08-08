@@ -183,8 +183,9 @@ fn clip_grad_value_bounds_every_gradient_element() {
 #[test]
 fn every_optimizer_minimizes_least_squares() {
     use fastnn::nn::Param;
+    type Recipe = fn(Vec<Param>) -> Box<dyn Optimizer>;
 
-    let recipes: Vec<(&str, fn(Vec<Param>) -> Box<dyn Optimizer>)> = vec![
+    let recipes: Vec<(&str, Recipe)> = vec![
         ("sgd", |p| Box::new(SGD::new(p, 0.1))),
         ("adam", |p| Box::new(Adam::new(p, 0.05))),
         ("adamw", |p| Box::new(AdamW::new(p, 0.05))),

@@ -181,7 +181,7 @@ impl Tensor {
         let (out_h, out_w) = window.output_size(height, width);
         let patch = self.dim(1);
         assert!(
-            patch % (kh * kw) == 0,
+            patch.is_multiple_of(kh * kw),
             "col2im: {patch} rows do not divide into {kh}×{kw} kernels"
         );
         assert_eq!(
