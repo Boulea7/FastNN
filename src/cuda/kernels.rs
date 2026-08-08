@@ -270,6 +270,46 @@ pub fn embedding_backward(
     Ok(out)
 }
 
+// ── Convolution lowering ─────────────────────────────────────────────────────
+
+/// Unfold `[n, c, h, w]` into `[n, c·kh·kw, out_h·out_w]` columns on the device.
+pub fn im2col(
+    input: &CudaBuffer,
+    (n, c, h, w): (usize, usize, usize, usize),
+    (kh, kw): (usize, usize),
+    (sh, sw): (usize, usize),
+    (ph, pw): (usize, usize),
+    (out_h, out_w): (usize, usize),
+) -> Result<CudaBuffer> {
+    launch(n * c * kh * kw * out_h * out_w, "im2col", |out| unsafe {
+        ffi::fastnn_cuda_im2col(
+            input.as_ptr(), out.as_mut_ptr(),
+            n as c_int, c as c_int, h as c_int, w as c_int,
+            kh as c_int, kw as c_int, sh as c_int, sw as c_int, ph as c_int, pw as c_int,
+            out_h as c_int, out_w as c_int,
+        )
+    })
+}
+
+/// Fold columns back into `[n, c, h, w]`, summing where windows overlapped.
+pub fn col2im(
+    cols: &CudaBuffer,
+    (n, c, h, w): (usize, usize, usize, usize),
+    (kh, kw): (usize, usize),
+    (sh, sw): (usize, usize),
+    (ph, pw): (usize, usize),
+    (out_h, out_w): (usize, usize),
+) -> Result<CudaBuffer> {
+    launch(n * c * h * w, "col2im", |out| unsafe {
+        ffi::fastnn_cuda_col2im(
+            cols.as_ptr(), out.as_mut_ptr(),
+            n as c_int, c as c_int, h as c_int, w as c_int,
+            kh as c_int, kw as c_int, sh as c_int, sw as c_int, ph as c_int, pw as c_int,
+            out_h as c_int, out_w as c_int,
+        )
+    })
+}
+
 fn to_c_ints(xs: &[usize]) -> Vec<c_int> {
     xs.iter().map(|&x| x as c_int).collect()
 }

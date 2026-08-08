@@ -6,6 +6,8 @@
 //! `col2im`: scatter each column back to the pixels it was copied from.
 
 use crate::autograd::ops::conv::Col2ImBackward;
+use crate::cuda::kernels;
+use crate::tensor::storage::Storage;
 use crate::tensor::Tensor;
 
 /// The four numbers that describe a 2-D sliding window.
@@ -58,6 +60,16 @@ impl Tensor {
         let (kh, kw) = window.kernel;
         let (out_h, out_w) = window.output_size(h, w);
         let (patch, positions) = (c * kh * kw, out_h * out_w);
+
+        if let Storage::Cuda(buf) = self.storage() {
+            let cols = kernels::im2col(
+                buf, (n, c, h, w), window.kernel, window.stride, window.padding, (out_h, out_w),
+            )
+            .expect("cuda im2col");
+            let input_shape = self.shape().to_vec();
+            return Tensor::raw(Storage::Cuda(cols), vec![n, patch, positions], self.device())
+                .with_grad(&[self], || Col2ImBackward { shape: input_shape, window });
+        }
 
         let src = self.to_vec();
         let mut cols = vec![0.0f32; n * patch * positions];

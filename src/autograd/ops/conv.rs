@@ -1,7 +1,9 @@
 //! Derivative of `im2col`.
 
 use crate::autograd::Backward;
+use crate::cuda::kernels;
 use crate::tensor::ops::conv::Window;
+use crate::tensor::storage::Storage;
 use crate::tensor::Tensor;
 
 /// Fold columns back into an image, adding where windows overlapped.
@@ -22,6 +24,15 @@ impl Backward for Col2ImBackward {
         let (ph, pw) = self.window.padding;
         let (out_h, out_w) = self.window.output_size(h, w);
         let (patch, positions) = (c * kh * kw, out_h * out_w);
+
+        if let Storage::Cuda(buf) = grad.storage() {
+            let image = kernels::col2im(
+                buf, (n, c, h, w), self.window.kernel, self.window.stride, self.window.padding,
+                (out_h, out_w),
+            )
+            .expect("cuda col2im");
+            return vec![Tensor::raw(Storage::Cuda(image), self.shape.clone(), grad.device())];
+        }
 
         let cols = grad.to_vec();
         let mut image = vec![0.0f32; n * c * h * w];

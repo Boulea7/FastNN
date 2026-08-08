@@ -84,6 +84,20 @@ extern "C" {
         n_ids: c_int, dim: c_int, vocab: c_int,
     ) -> c_int;
 
+    // ── Convolution lowering ─────────────────────────────────────────────────
+    pub fn fastnn_cuda_im2col(
+        input: *const f32, cols: *mut f32,
+        n: c_int, c: c_int, h: c_int, w: c_int,
+        kh: c_int, kw: c_int, sh: c_int, sw: c_int, ph: c_int, pw: c_int,
+        out_h: c_int, out_w: c_int,
+    ) -> c_int;
+    pub fn fastnn_cuda_col2im(
+        cols: *const f32, image: *mut f32,
+        n: c_int, c: c_int, h: c_int, w: c_int,
+        kh: c_int, kw: c_int, sh: c_int, sw: c_int, ph: c_int, pw: c_int,
+        out_h: c_int, out_w: c_int,
+    ) -> c_int;
+
     // ── GEMM (cuBLAS). `nt`/`tn` transpose in place, with no staging buffer. ─
     pub fn fastnn_cuda_matmul(
         a: *const f32, b: *const f32, c: *mut f32,

@@ -66,3 +66,5 @@ int fastnn_cuda_init(int device_id)                                           {(
 int fastnn_cuda_device_count(void)                                            {return 0;}
 int fastnn_cuda_synchronize(void)                                             {STUB;}
 void fastnn_cuda_get_memory_info(size_t*free,size_t*total)                   {if(free)*free=0;if(total)*total=0;}
+int fastnn_cuda_im2col(const float*i,float*o,int n,int c,int h,int w,int kh,int kw,int sh,int sw,int ph,int pw,int oh,int ow){(void)i;(void)o;(void)n;(void)c;(void)h;(void)w;(void)kh;(void)kw;(void)sh;(void)sw;(void)ph;(void)pw;(void)oh;(void)ow;STUB;}
+int fastnn_cuda_col2im(const float*i,float*o,int n,int c,int h,int w,int kh,int kw,int sh,int sw,int ph,int pw,int oh,int ow){(void)i;(void)o;(void)n;(void)c;(void)h;(void)w;(void)kh;(void)kw;(void)sh;(void)sw;(void)ph;(void)pw;(void)oh;(void)ow;STUB;}

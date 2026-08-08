@@ -1923,3 +1923,89 @@ extern "C" int fastnn_cuda_gather(const float* input, const int* indices, float*
     CUDA_CHECK(cudaGetLastError());
     return 0;
 }
+
+// ============================================================================
+// Convolution lowering: im2col / col2im
+// ============================================================================
+__global__ void kernel_im2col(const float* input, float* cols,
+                              int c, int h, int w,
+                              int kh, int kw, int sh, int sw, int ph, int pw,
+                              int out_h, int out_w, int total) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= total) return;
+
+    int positions = out_h * out_w;
+    int patch = c * kh * kw;
+    int pos = i % positions;
+    int row = (i / positions) % patch;
+    int image = i / (positions * patch);
+
+    int ow = pos % out_w, oh = pos / out_w;
+    int kj = row % kw, ki = (row / kw) % kh, channel = row / (kw * kh);
+
+    int ih = oh * sh + ki - ph;
+    int iw = ow * sw + kj - pw;
+
+    float value = 0.0f;
+    if (ih >= 0 && ih < h && iw >= 0 && iw < w)
+        value = input[((image * c + channel) * h + ih) * w + iw];
+    cols[i] = value;
+}
+
+extern "C" int fastnn_cuda_im2col(const float* input, float* cols,
+                                  int n, int c, int h, int w,
+                                  int kh, int kw, int sh, int sw, int ph, int pw,
+                                  int out_h, int out_w) {
+    int total = n * c * kh * kw * out_h * out_w;
+    int blocks = div_ceil(total, BLOCK_SIZE);
+    kernel_im2col<<<blocks, BLOCK_SIZE>>>(input, cols, c, h, w, kh, kw, sh, sw, ph, pw, out_h, out_w, total);
+    CUDA_CHECK(cudaGetLastError());
+    return 0;
+}
+
+// One thread per input pixel, summing every window that covered it. Walking
+// the windows from the pixel's side needs no atomics, unlike scattering from
+// the columns' side.
+__global__ void kernel_col2im(const float* cols, float* image,
+                              int c, int h, int w,
+                              int kh, int kw, int sh, int sw, int ph, int pw,
+                              int out_h, int out_w, int total) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= total) return;
+
+    int iw = i % w;
+    int ih = (i / w) % h;
+    int channel = (i / (w * h)) % c;
+    int image_i = i / (w * h * c);
+
+    int positions = out_h * out_w;
+    int patch = c * kh * kw;
+
+    float acc = 0.0f;
+    for (int ki = 0; ki < kh; ki++) {
+        int t = ih + ph - ki;
+        if (t < 0 || t % sh != 0) continue;
+        int oh = t / sh;
+        if (oh >= out_h) continue;
+        for (int kj = 0; kj < kw; kj++) {
+            int u = iw + pw - kj;
+            if (u < 0 || u % sw != 0) continue;
+            int ow = u / sw;
+            if (ow >= out_w) continue;
+            int row = (channel * kh + ki) * kw + kj;
+            acc += cols[(image_i * patch + row) * positions + oh * out_w + ow];
+        }
+    }
+    image[i] = acc;
+}
+
+extern "C" int fastnn_cuda_col2im(const float* cols, float* image,
+                                  int n, int c, int h, int w,
+                                  int kh, int kw, int sh, int sw, int ph, int pw,
+                                  int out_h, int out_w) {
+    int total = n * c * h * w;
+    int blocks = div_ceil(total, BLOCK_SIZE);
+    kernel_col2im<<<blocks, BLOCK_SIZE>>>(cols, image, c, h, w, kh, kw, sh, sw, ph, pw, out_h, out_w, total);
+    CUDA_CHECK(cudaGetLastError());
+    return 0;
+}

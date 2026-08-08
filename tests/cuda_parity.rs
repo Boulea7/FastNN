@@ -347,3 +347,18 @@ fn a_model_trains_identically_on_both_devices() {
     let on_gpu = train(device);
     assert_close("final loss", &[on_cpu], &[on_gpu], MODEL_TOLERANCE);
 }
+
+#[test]
+fn convolution_lowering() {
+    // Stride 2 with padding 1 exercises both the padding zeros and the
+    // windows-overlap accumulation in col2im.
+    let x = sample(&[2, 3, 6, 5]);
+    let window = Window::square(3, 2, 1);
+
+    check_forward("im2col", &[x.clone()], |v| v[0].im2col(window));
+    check_backward("im2col", &[x.clone()], |v| {
+        let cols = v[0].im2col(window);
+        let weight = Tensor::from_vec(spread(cols.numel(), -0.9, 0.9), cols.shape()).to(cols.device());
+        cols.mul(&weight).sum()
+    });
+}
