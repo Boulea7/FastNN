@@ -52,6 +52,26 @@ path = "examples/mnist_cnn.rs"
 name = "char_lm"
 path = "examples/char_lm.rs"
 
+[[example]]
+name = "finetune"
+path = "examples/finetune.rs"
+
+[[example]]
+name = "gan"
+path = "examples/gan.rs"
+
+[[example]]
+name = "vae"
+path = "examples/vae.rs"
+
+[[example]]
+name = "reinforce"
+path = "examples/reinforce.rs"
+
+[[example]]
+name = "multi_task"
+path = "examples/multi_task.rs"
+
 [[bench]]
 name = "tensor_ops"
 harness = false
