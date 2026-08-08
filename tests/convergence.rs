@@ -176,3 +176,47 @@ fn clip_grad_value_bounds_every_gradient_element() {
     let grad = param.grad().unwrap().to_vec();
     assert!(grad.iter().all(|g| g.abs() <= 1.5), "gradient escaped the clamp: {grad:?}");
 }
+
+/// Every optimizer, one benchmark: recover a linear map by least squares.
+/// Learning rates are per-optimizer (a shared one would test tuning, not
+/// correctness); each must reach near-zero loss on the same data.
+#[test]
+fn every_optimizer_minimizes_least_squares() {
+    use fastnn::nn::Param;
+
+    let recipes: Vec<(&str, fn(Vec<Param>) -> Box<dyn Optimizer>)> = vec![
+        ("sgd", |p| Box::new(SGD::new(p, 0.1))),
+        ("adam", |p| Box::new(Adam::new(p, 0.05))),
+        ("adamw", |p| Box::new(AdamW::new(p, 0.05))),
+        ("rmsprop", |p| Box::new(RMSprop::new(p, 0.01))),
+        ("rmsprop-centered", |p| Box::new(RMSprop::new(p, 0.01).momentum(0.9).centered())),
+        ("adagrad", |p| Box::new(Adagrad::new(p, 0.5))),
+        ("adadelta", |p| Box::new(Adadelta::new(p))),
+        ("radam", |p| Box::new(RAdam::new(p, 0.05))),
+        ("lion", |p| Box::new(Lion::new(p, 0.005))),
+        ("lookahead-adam", |p| Box::new(Lookahead::new(Adam::new(p, 0.05), 5, 0.5))),
+    ];
+
+    for (name, make) in recipes {
+        manual_seed(9);
+        let inputs = Tensor::randn(&[64, 3]);
+        let true_map = Tensor::from_vec(vec![1.0, -2.0, 0.5], &[3, 1]);
+        let targets = inputs.matmul(&true_map);
+
+        let model = Linear::new(3, 1);
+        let mut opt = make(model.parameters());
+
+        let mut loss_value = f32::MAX;
+        for _ in 0..1500 {
+            let loss = mse(&model.forward(&inputs), &targets);
+            opt.zero_grad();
+            loss.backward();
+            opt.step();
+            loss_value = loss.item();
+            if loss_value < 1e-3 {
+                break;
+            }
+        }
+        assert!(loss_value < 1e-3, "{name} failed to converge: loss {loss_value}");
+    }
+}

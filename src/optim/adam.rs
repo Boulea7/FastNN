@@ -64,7 +64,9 @@ impl Moments {
 }
 
 /// `β·previous + (1-β)·value`, starting from zero on the first step.
-fn blend(previous: Option<&Tensor>, value: &Tensor, beta: f32) -> Tensor {
+///
+/// The exponential moving average every adaptive optimizer is built on.
+pub(crate) fn blend(previous: Option<&Tensor>, value: &Tensor, beta: f32) -> Tensor {
     let fresh = value.mul_scalar(1.0 - beta);
     match previous {
         Some(previous) => previous.mul_scalar(beta).add(&fresh),

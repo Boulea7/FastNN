@@ -106,8 +106,9 @@ pub mod prelude {
         LSTM,
     };
     pub use crate::optim::{
-        clip_grad_norm, clip_grad_value, Adam, AdamW, Constant, CosineAnnealing, LrSchedule, OneCycle, Optimizer,
-        OptimizerState, StepDecay, Warmup, SGD,
+        clip_grad_norm, clip_grad_value, Adadelta, Adagrad, Adam, AdamW, Constant, CosineAnnealing,
+        Ema, Lion, Lookahead, LrSchedule, OneCycle, Optimizer, OptimizerState, RAdam, RMSprop,
+        StepDecay, Warmup, SGD,
     };
     pub use crate::rng::manual_seed;
     pub use crate::serialize::{load, load_training, save, save_training};

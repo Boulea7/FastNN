@@ -21,12 +21,24 @@
 //! Updates run on whichever device the parameters live on: they are written with
 //! tensor ops, so a GPU model never round-trips to the host to take a step.
 
+pub mod adagrad;
 pub mod adam;
+pub mod ema;
+pub mod lion;
+pub mod lookahead;
+pub mod radam;
+pub mod rmsprop;
 pub mod schedule;
 pub mod sgd;
 pub mod state;
 
+pub use adagrad::{Adadelta, Adagrad};
 pub use adam::{Adam, AdamW};
+pub use ema::Ema;
+pub use lion::Lion;
+pub use lookahead::Lookahead;
+pub use radam::RAdam;
+pub use rmsprop::RMSprop;
 pub use schedule::{CosineAnnealing, Constant, LrSchedule, OneCycle, StepDecay, Warmup};
 pub use sgd::SGD;
 pub use state::OptimizerState;
