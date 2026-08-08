@@ -59,10 +59,11 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
+      # No version pin: the action's default tracks what the runner image can
+      # actually install, and any recent nvcc compiles these kernels.
       - name: Install CUDA toolkit (no driver, compile only)
         uses: Jimver/cuda-toolkit@v0.2.36
         with:
-          cuda: '12.4.1'
           method: 'network'
 
       - name: Cache cargo
