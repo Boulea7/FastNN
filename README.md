@@ -2,8 +2,9 @@
 
 A deep learning library in Rust, with CUDA kernels for the parts that matter.
 
-Tensors with autograd, the usual layers, optimizers, data loading, and
-checkpoints — small enough to read end to end, and it actually trains.
+Tensors with autograd, the usual layers, optimizers, losses, data loading,
+checkpoints, KV-cached text generation, and safetensors interchange — small
+enough to read end to end, and it actually trains.
 
 ```rust
 use fastnn::prelude::*;
@@ -172,7 +173,7 @@ each operation, and they build the same graph.
 
 ## Layout
 
-Every file is one idea, and none are long. 71 files, ~8.0k lines.
+Every file is one idea, and none are long. 86 source files, ~11k lines.
 
 ```
 src/
@@ -185,7 +186,7 @@ src/
     init.rs          zeros, randn, kaiming, xavier, ...
     ops/             one file per category
       arith  unary  activation  matmul  reduce  view  index
-      conv  pool  norm
+      conv (im2col/col2im)  pool  norm
 
   autograd/        reverse-mode differentiation
     node.rs          Backward trait, graph nodes, gradient slots
@@ -195,13 +196,18 @@ src/
     ops/             one backward rule per forward op, same file names
 
   nn/              layers, all implementing Module
-    module.rs param.rs sequential.rs linear.rs conv.rs pooling.rs
+    module.rs param.rs sequential.rs linear.rs
+    conv.rs conv1d.rs conv_transpose.rs pooling.rs
     norm.rs activation.rs dropout.rs shape.rs embedding.rs
-    attention.rs transformer.rs rnn.rs loss.rs
+    attention.rs transformer.rs decoder.rs rnn.rs
+    cache.rs (kv cache)  sample.rs (temperature/top-k/top-p)  beam.rs
+    loss.rs metric_losses.rs
 
-  optim/           sgd.rs  adam.rs  schedule.rs  state.rs
+  optim/           sgd adam rmsprop adagrad radam lion lookahead ema
+                   schedule.rs  state.rs
   data/            dataset.rs  loader.rs  mnist.rs
-  serialize/       checkpoint.rs (weights)  training.rs (weights + optimizer)
+  serialize/       checkpoint.rs  training.rs (weights + optimizer)
+                   safetensors.rs (interchange, reads F32/F16/BF16)  half.rs
   cuda/            ffi.rs (raw bindings)  kernels.rs (safe wrappers)  buffer.rs
   rng.rs  error.rs  lib.rs
 
@@ -274,9 +280,11 @@ load(&model, "model.fdl")?;          // missing file, or a shape that moved
 ## Testing
 
 ```bash
-cargo test --test gradcheck    # every backward rule
+cargo test --test gradcheck    # every backward rule vs finite differences
 cargo test --test robustness   # resume, anomalies, freezing
-cargo test --test generation   # kv-cached decoding, sampling
+cargo test --test generation   # kv-cached decoding, masks, beam, sampling
+cargo test --test convergence  # every layer family and optimizer actually learns
+cargo test --test losses       # loss values against hand-computed references
 cargo test --features cuda --test cuda_parity -- --test-threads=1   # CPU vs GPU
 cargo test                     # everything
 cargo bench                    # throughput
@@ -312,9 +320,8 @@ a training step creates cost a hash lookup instead of a driver round trip.
 
 ## Limitations
 
-- `f32` only.
-- Convolution unfolds to a matrix multiply, and the unfold itself runs on the
-  host. The multiply is on the GPU; the `im2col` around it is not.
+- `f32` compute. Checkpoints stored as `F16`/`BF16` load fine (widened on
+  read), but the maths runs in single precision.
 - `LSTM` and `GRU` are built from ordinary differentiable ops, one graph node per
   gate per timestep. Correct, and fine for short sequences — use a transformer
   for long ones.
