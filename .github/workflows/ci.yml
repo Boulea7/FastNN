@@ -45,3 +45,37 @@ jobs:
 
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
+
+  # Hosted runners have no GPU, so the kernels cannot run here. They still
+  # compile: nvcc parses kernels.cu, the linker resolves every FFI symbol
+  # against the real libraries, and a signature drift between ffi.rs and the
+  # kernels fails in CI instead of on the next machine with a GPU. The parity
+  # suite notices there is no device at runtime and skips itself.
+  cuda-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install CUDA toolkit (no driver, compile only)
+        uses: Jimver/cuda-toolkit@v0.2.36
+        with:
+          cuda: '12.4.1'
+          method: 'network'
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-cuda-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build with the cuda feature
+        run: cargo build --features cuda --all-targets
+
+      - name: Parity tests (self-skip without a device)
+        run: cargo test --features cuda --test cuda_parity -- --test-threads=1
