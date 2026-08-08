@@ -1,7 +1,7 @@
 //! Derivatives of element-wise maths.
 //!
 //! Each rule multiplies the incoming gradient by a local derivative. Where that
-//! derivative is a simple function of the saved input, [`elementwise`] builds it.
+//! derivative is a simple function of the saved input, `elementwise` builds it.
 
 use crate::autograd::Backward;
 use crate::tensor::Tensor;

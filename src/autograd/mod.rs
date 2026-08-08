@@ -19,7 +19,7 @@
 //!
 //! 1. Write the forward in `tensor/ops/`.
 //! 2. Write a `Backward` rule in [`ops`], saving only what the derivative needs.
-//! 3. Attach it with [`Tensor::with_grad`](crate::tensor::Tensor::with_grad).
+//! 3. Attach it with `Tensor::with_grad`.
 //! 4. Add a finite-difference check in `tests/gradcheck.rs`.
 
 pub mod anomaly;

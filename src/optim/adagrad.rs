@@ -8,8 +8,8 @@
 //! Adadelta is the repair: replace the total with an exponential average, and
 //! replace the global learning rate with a running average of the updates
 //! themselves, so the step size carries the *units* of the parameter — the
-//! ratio √E[Δx²]/√E[g²] is dimensionally an x per g, where Adagrad's 1/√E[g²]
-//! is not.
+//! ratio `√E[Δx²]/√E[g²]` is dimensionally an x per g, where Adagrad's
+//! `1/√E[g²]` is not.
 
 use crate::error::Result;
 use crate::nn::Param;
