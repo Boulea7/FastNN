@@ -121,3 +121,85 @@ fn sampling_respects_the_distribution() {
         assert_eq!(sampler.sample(&logits), 0);
     }
 }
+
+/// A masked (padded) key position must have no influence on other positions:
+/// change its content and every unpadded row's output stays identical.
+#[test]
+fn padding_mask_blocks_padded_positions() {
+    let encoder = TransformerStack::encoder(16, 2, 32, 1, 0.1);
+    encoder.set_training(false);
+    let mask = Tensor::from_vec(vec![1.0, 1.0, 1.0, 0.0], &[1, 4]);
+
+    let a = Tensor::randn(&[1, 4, 16]);
+    // Same first three positions, different content in the padded fourth.
+    let mut data = a.to_vec();
+    for slot in data.iter_mut().skip(3 * 16) {
+        *slot += 5.0;
+    }
+    let b = Tensor::from_vec(data, &[1, 4, 16]);
+
+    let out_a = no_grad(|| encoder.forward_masked(&a, Some(&mask)));
+    let out_b = no_grad(|| encoder.forward_masked(&b, Some(&mask)));
+    assert_close(
+        &out_a.narrow(1, 0, 3),
+        &out_b.narrow(1, 0, 3),
+        "padded position leaked into real ones",
+    );
+}
+
+/// Same property through the decoder's cross-attention: masked memory
+/// positions must not reach the target side at all.
+#[test]
+fn memory_mask_blocks_padded_source_positions() {
+    let decoder = TransformerDecoder::new(16, 2, 32, 1, 0.1);
+    decoder.set_training(false);
+    let mask = Tensor::from_vec(vec![1.0, 1.0, 0.0], &[1, 3]);
+    let target = Tensor::randn(&[1, 4, 16]);
+
+    let memory_a = Tensor::randn(&[1, 3, 16]);
+    let mut data = memory_a.to_vec();
+    for slot in data.iter_mut().skip(2 * 16) {
+        *slot -= 7.0;
+    }
+    let memory_b = Tensor::from_vec(data, &[1, 3, 16]);
+
+    let out_a = no_grad(|| decoder.decode_masked(&target, &memory_a, Some(&mask)));
+    let out_b = no_grad(|| decoder.decode_masked(&target, &memory_b, Some(&mask)));
+    assert_close(&out_a, &out_b, "masked memory leaked through cross-attention");
+}
+
+/// The best second token can hide behind the second-best first token; a width
+/// of 2 must find the sequence a greedy width of 1 misses.
+#[test]
+fn beam_search_finds_what_greedy_misses() {
+    let step = |seq: &[usize]| match seq.last() {
+        // From the start: token 0 is slightly likelier than token 1.
+        Some(9) => vec![0.55f32.ln(), 0.45f32.ln(), f32::NEG_INFINITY],
+        // After the greedy pick, everything is mediocre.
+        Some(0) => vec![0.5f32.ln(), 0.5f32.ln(), f32::NEG_INFINITY],
+        // After the runner-up, one continuation is near-certain.
+        _ => vec![0.99f32.ln(), 0.01f32.ln(), f32::NEG_INFINITY],
+    };
+
+    let greedy = BeamSearch::new(1).decode(&[9], 2, step);
+    let beamed = BeamSearch::new(2).decode(&[9], 2, step);
+    assert_eq!(greedy[0], 0, "width 1 should behave greedily");
+    assert_eq!(beamed, vec![1, 0], "width 2 should find the higher-probability path");
+}
+
+#[test]
+fn beam_search_stops_at_eos() {
+    // Token 2 is end-of-sequence and always the most likely continuation.
+    let step = |_: &[usize]| vec![0.0, 1.0, 5.0];
+    let out = BeamSearch::new(2).eos(2).decode(&[0], 10, step);
+    assert!(out.is_empty(), "eos as first token should end generation, got {out:?}");
+}
+
+#[test]
+fn repetition_penalty_discourages_used_tokens() {
+    let logits = Tensor::from_vec(vec![1.0, 1.2], &[2]);
+    let sampler = Sampler::greedy().repetition_penalty(2.0);
+
+    assert_eq!(sampler.sample(&logits), 1);
+    assert_eq!(sampler.sample_with_history(&logits, &[1]), 0);
+}

@@ -107,3 +107,16 @@ pub fn clip_grad_norm(params: &[Param], max_norm: f32) -> f32 {
     }
     total
 }
+
+/// Clamp every gradient element into `[-max_value, max_value]`.
+///
+/// Cruder than [`clip_grad_norm`] — it changes the gradient's direction, not
+/// just its length — but robust to a single exploded element. Call between
+/// `backward()` and `step()`.
+pub fn clip_grad_value(params: &[Param], max_value: f32) {
+    for param in params {
+        if let Some(grad) = param.grad() {
+            param.set_grad(grad.clamp(-max_value, max_value));
+        }
+    }
+}

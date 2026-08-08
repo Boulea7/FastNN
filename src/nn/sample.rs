@@ -23,12 +23,13 @@ pub struct Sampler {
     temperature: f32,
     top_k: Option<usize>,
     top_p: Option<f32>,
+    repetition_penalty: f32,
 }
 
 impl Sampler {
     /// Plain sampling from the softmax of the logits.
     pub fn new() -> Sampler {
-        Sampler { temperature: 1.0, top_k: None, top_p: None }
+        Sampler { temperature: 1.0, top_k: None, top_p: None, repetition_penalty: 1.0 }
     }
 
     /// Always the most likely token. Equivalent to `temperature(0.0)`.
@@ -57,13 +58,42 @@ impl Sampler {
         self
     }
 
+    /// Discourage tokens that already appeared. 1.0 is off; 1.1–1.3 is the
+    /// usual range. Applied through [`sample_with_history`](Self::sample_with_history).
+    pub fn repetition_penalty(mut self, penalty: f32) -> Sampler {
+        assert!(penalty >= 1.0, "repetition_penalty must be >= 1, got {penalty}");
+        self.repetition_penalty = penalty;
+        self
+    }
+
     /// Draw a token id from `logits`, the unnormalized scores for one position.
     ///
     /// Any shape holding exactly the vocabulary — `[vocab]` or `[1, vocab]` —
     /// is fine; the elements are read in order.
     pub fn sample(&self, logits: &Tensor) -> usize {
-        let logits = logits.to_vec();
+        self.sample_with_history(logits, &[])
+    }
+
+    /// [`sample`](Self::sample), penalising tokens that appear in `history`.
+    ///
+    /// A positive logit is divided by the penalty and a negative one multiplied,
+    /// so "already used" always means "less likely", whichever side of zero the
+    /// score sits on.
+    pub fn sample_with_history(&self, logits: &Tensor, history: &[usize]) -> usize {
+        let mut logits = logits.to_vec();
         assert!(!logits.is_empty(), "cannot sample from empty logits");
+
+        if self.repetition_penalty > 1.0 {
+            for &id in history {
+                if let Some(logit) = logits.get_mut(id) {
+                    *logit = if *logit > 0.0 {
+                        *logit / self.repetition_penalty
+                    } else {
+                        *logit * self.repetition_penalty
+                    };
+                }
+            }
+        }
 
         // Most likely first. Sorting the whole vocabulary is fine at the sizes
         // sampling sees, and gives top-k and top-p the same prefix structure.

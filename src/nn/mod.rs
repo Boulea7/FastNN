@@ -30,8 +30,10 @@
 
 pub mod activation;
 pub mod attention;
+pub mod beam;
 pub mod cache;
 pub mod conv;
+pub mod decoder;
 pub mod dropout;
 pub mod embedding;
 pub mod linear;
@@ -48,8 +50,10 @@ pub mod transformer;
 
 pub use activation::{LeakyReLU, ReLU, Sigmoid, SiLU, Softmax, Tanh, GELU};
 pub use attention::MultiHeadAttention;
+pub use beam::BeamSearch;
 pub use cache::{KvCache, StackCache};
 pub use conv::Conv2d;
+pub use decoder::{Transformer, TransformerDecoder, TransformerDecoderBlock};
 pub use dropout::Dropout;
 pub use embedding::{Embedding, PositionalEncoding};
 pub use linear::Linear;

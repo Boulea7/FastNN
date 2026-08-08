@@ -18,7 +18,7 @@ pub enum Activation {
 }
 
 impl Activation {
-    fn apply(self, x: &Tensor) -> Tensor {
+    pub(crate) fn apply(self, x: &Tensor) -> Tensor {
         match self {
             Activation::ReLU => x.relu(),
             Activation::GELU => x.gelu(),
@@ -74,6 +74,19 @@ impl TransformerBlock {
         }
     }
 
+    /// [`forward`](Module::forward) with a key padding mask: `[batch, len]`,
+    /// 1 for real positions and 0 for padding, so a batch of unequal-length
+    /// sequences attends only to its own content.
+    pub fn forward_masked(&self, input: &Tensor, key_mask: Option<&Tensor>) -> Tensor {
+        let normed = self.norm_attention.forward(input);
+        let attended = self.attention.attend_masked(&normed, &normed, &normed, self.causal, key_mask);
+        let residual = input.add(&self.dropout.forward(&attended));
+
+        let normed = self.norm_feedforward.forward(&residual);
+        let hidden = self.activation.apply(&self.up.forward(&normed));
+        residual.add(&self.dropout.forward(&self.down.forward(&hidden)))
+    }
+
     /// [`forward`](Module::forward) with the attention keys and values cached
     /// for incremental decoding.
     ///
@@ -93,13 +106,7 @@ impl TransformerBlock {
 
 impl Module for TransformerBlock {
     fn forward(&self, input: &Tensor) -> Tensor {
-        let normed = self.norm_attention.forward(input);
-        let attended = self.attention.attend(&normed, &normed, &normed, self.causal);
-        let residual = input.add(&self.dropout.forward(&attended));
-
-        let normed = self.norm_feedforward.forward(&residual);
-        let hidden = self.activation.apply(&self.up.forward(&normed));
-        residual.add(&self.dropout.forward(&self.down.forward(&hidden)))
+        self.forward_masked(input, None)
     }
 
     fn named_parameters(&self) -> Vec<(String, Param)> {
@@ -148,6 +155,16 @@ impl TransformerStack {
     /// A cache sized for this stack, ready for [`forward_cached`](Self::forward_cached).
     pub fn new_cache(&self) -> StackCache {
         StackCache::new(self.blocks.len())
+    }
+
+    /// [`forward`](Module::forward) with a key padding mask applied in every
+    /// block. See [`TransformerBlock::forward_masked`].
+    pub fn forward_masked(&self, input: &Tensor, key_mask: Option<&Tensor>) -> Tensor {
+        let hidden = self
+            .blocks
+            .iter()
+            .fold(input.clone(), |x, block| block.forward_masked(&x, key_mask));
+        self.norm.forward(&hidden)
     }
 
     /// [`forward`](Module::forward) through per-block KV caches, for feeding a

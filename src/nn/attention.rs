@@ -48,6 +48,23 @@ impl MultiHeadAttention {
     /// With `causal` set, position `i` can only see positions `≤ i` — what a
     /// language model needs so it cannot read ahead.
     pub fn attend(&self, query: &Tensor, key: &Tensor, value: &Tensor, causal: bool) -> Tensor {
+        self.attend_masked(query, key, value, causal, None)
+    }
+
+    /// [`attend`](Self::attend) with an optional key padding mask.
+    ///
+    /// `key_mask` is `[batch, kv_len]`: 1 where a key position is real, 0 where
+    /// it is padding. Padded positions get the same additive `-1e9` treatment as
+    /// the causal mask, so softmax gives them zero weight and batches of
+    /// unequal-length sequences attend only to their own content.
+    pub fn attend_masked(
+        &self,
+        query: &Tensor,
+        key: &Tensor,
+        value: &Tensor,
+        causal: bool,
+        key_mask: Option<&Tensor>,
+    ) -> Tensor {
         let (batch, q_len, embed_dim) = (query.dim(0), query.dim(1), query.dim(2));
         let kv_len = key.dim(1);
         let lanes = batch * self.heads;
@@ -62,6 +79,21 @@ impl MultiHeadAttention {
             // An additive -inf bias rather than an in-place overwrite: the mask
             // stays part of the graph, so gradients still flow through softmax.
             scores = scores.add(&causal_mask(lanes, q_len, kv_len, scores.device()));
+        }
+        if let Some(mask) = key_mask {
+            assert_eq!(
+                mask.shape(), &[batch, kv_len],
+                "key mask must be [batch, kv_len] = [{batch}, {kv_len}]"
+            );
+            // 1/0 keep/pad → 0/-1e9, repeated per head so it broadcasts over
+            // the [batch·heads, q_len, kv_len] scores.
+            let bias = mask
+                .add_scalar(-1.0)
+                .mul_scalar(1e9)
+                .reshape(&[batch as i64, 1, kv_len as i64])
+                .expand(&[batch, self.heads, kv_len])
+                .reshape(&[lanes as i64, 1, kv_len as i64]);
+            scores = scores.add(&bias);
         }
 
         let weights = self.dropout.forward(&scores.softmax());

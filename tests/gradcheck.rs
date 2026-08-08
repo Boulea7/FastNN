@@ -433,3 +433,30 @@ fn no_grad_builds_no_graph() {
     out.backward();
     assert!(param.grad().is_none(), "no_grad should leave nothing to differentiate");
 }
+
+#[test]
+fn decoder_gradients_reach_every_projection() {
+    let transformer = Transformer::new(8, 2, 16, 1, 1, 0.0);
+    let source = sample(&[2, 3, 8]);
+    let target = sample(&[2, 4, 8]);
+
+    transformer.run(&source, &target).sum().backward();
+
+    for (name, param) in transformer.named_parameters() {
+        assert!(param.grad().is_some(), "no gradient reached {name}");
+    }
+}
+
+#[test]
+fn masked_attention_matches_finite_differences() {
+    let attention = MultiHeadAttention::new(4, 2, 0.0);
+    let mask = Tensor::from_vec(vec![1.0, 1.0, 0.0], &[1, 3]);
+    let weight = sample(&[1, 3, 4]);
+
+    gradcheck("attend_masked", &[sample(&[1, 3, 4])], |v| {
+        attention
+            .attend_masked(&v[0], &v[0], &v[0], false, Some(&mask))
+            .mul(&weight)
+            .sum()
+    });
+}
