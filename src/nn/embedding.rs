@@ -1,6 +1,6 @@
 //! Embedding table and positional encoding.
 
-use crate::tensor::Tensor;
+use crate::tensor::{ops::index::index_from_f32, Tensor};
 
 use super::module::Module;
 use super::param::Param;
@@ -54,10 +54,11 @@ impl Embedding {
 }
 
 impl Module for Embedding {
-    /// Treats the input's values as ids. Prefer [`lookup`](Embedding::lookup) —
-    /// it takes `usize` and cannot silently truncate a float.
+    /// Treats finite, non-negative integer values as ids.
+    /// Panics if an id cannot be represented as `usize`.
+    /// Prefer [`lookup`](Embedding::lookup), which takes `usize` directly.
     fn forward(&self, input: &Tensor) -> Tensor {
-        let ids: Vec<usize> = input.to_vec().iter().map(|&v| v as usize).collect();
+        let ids: Vec<usize> = input.to_vec().into_iter().map(index_from_f32).collect();
         let mut shape: Vec<i64> = input.shape().iter().map(|&d| d as i64).collect();
         shape.push(self.dim as i64);
         self.lookup(&ids).reshape(&shape)
