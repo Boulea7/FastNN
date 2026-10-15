@@ -35,8 +35,13 @@ impl Linear {
     /// its own shift follows immediately.
     pub fn no_bias(in_features: usize, out_features: usize) -> Linear {
         Linear {
+            weight: Param::new(Tensor::kaiming_uniform(
+                &[out_features, in_features],
+                in_features,
+            )),
             bias: None,
-            ..Linear::new(in_features, out_features)
+            in_features,
+            out_features,
         }
     }
 
